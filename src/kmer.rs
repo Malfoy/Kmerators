@@ -83,7 +83,9 @@ pub fn revcomp(seq: &[u8]) -> Option<Vec<u8>> {
 pub fn hash_bytes(seq: &[u8]) -> u64 {
     let mut hasher = AHasher::default();
     hasher.write_usize(seq.len());
-    hasher.write(seq);
+    for &base in seq {
+        hasher.write_u8(base);
+    }
     hasher.finish()
 }
 
@@ -248,5 +250,42 @@ mod tests {
     #[test]
     fn sliding_window_minima() {
         assert_eq!(window_minima(&[5, 4, 7, 3, 6], 3), vec![4, 3, 3]);
+    }
+
+    #[test]
+    fn key_mode_uses_exact_keys_through_k31() {
+        assert_eq!(KeyMode::for_k(31), KeyMode::ExactU64);
+        assert_eq!(KeyMode::for_k(32), KeyMode::HashedU64);
+    }
+
+    #[test]
+    fn invalid_bases_reject_exact_keys_and_revcomp() {
+        assert_eq!(encode_forward_exact(b"ACN"), None);
+        assert_eq!(canonical_key(b"ACN", KeyMode::ExactU64), None);
+        assert_eq!(revcomp(b"ACN"), None);
+    }
+
+    #[test]
+    fn minimizer_values_use_two_bit_rolling_encoding() {
+        assert_eq!(minimizer_values(b"ACTG", 2), vec![1, 6, 11]);
+    }
+
+    #[test]
+    fn kmer_keys_include_forward_and_canonical_values() {
+        assert_eq!(
+            kmer_keys_for_chunk(b"ACGT", 3, KeyMode::ExactU64),
+            vec![(7, 7), (30, 7)]
+        );
+    }
+
+    #[test]
+    fn hashed_canonical_matches_reverse_complement_for_long_kmers() {
+        let seq = b"ACTGACTGACTGACTGACTGACTGACTGACTG";
+        let rc = revcomp(seq).unwrap();
+
+        assert_eq!(
+            canonical_key(seq, KeyMode::HashedU64),
+            canonical_key(&rc, KeyMode::HashedU64)
+        );
     }
 }

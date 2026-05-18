@@ -26,7 +26,7 @@ pub struct Cli {
     #[arg(short = 'd', long = "datadir")]
     pub datadir: Option<PathBuf>,
 
-    /// Reference genome FASTA/FASTQ to scan. Compressed input is supported by helicase.
+    /// Reference genome FASTA/FASTQ to scan. Plain, gzip, zstd, and xz input is supported.
     #[arg(short = 'g', long = "genome")]
     pub genome: Option<PathBuf>,
 
@@ -568,6 +568,46 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("duplicate --kmer-length value: 31")
+        );
+    }
+
+    #[test]
+    fn species_aliases_are_normalized() {
+        let mut cli = empty_cli();
+        cli.list_dataset = true;
+        cli.specie = Some("human".to_string());
+
+        let cfg = config::path_for_tests(Path::new("config.ini"));
+        let args = Args::from_cli_and_config(cli, &cfg).unwrap();
+
+        assert_eq!(args.specie, "homo_sapiens");
+    }
+
+    #[test]
+    fn mutually_exclusive_actions_are_rejected() {
+        let mut cli = empty_cli();
+        cli.selection = vec!["NPM1".to_string()];
+        cli.list_dataset = true;
+
+        let cfg = config::path_for_tests(Path::new("config.ini"));
+        let err = Args::from_cli_and_config(cli, &cfg).unwrap_err();
+
+        assert!(err.to_string().contains("actions are mutually exclusive"));
+    }
+
+    #[test]
+    fn minimizer_length_must_not_exceed_kmer_length() {
+        let mut cli = empty_cli();
+        cli.list_dataset = true;
+        cli.kmer_length = vec![3];
+        cli.minimizer_length = Some(4);
+
+        let cfg = config::path_for_tests(Path::new("config.ini"));
+        let err = Args::from_cli_and_config(cli, &cfg).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("--minimizer-length must be in 1..=k")
         );
     }
 }

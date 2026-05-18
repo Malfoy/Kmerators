@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -15,15 +16,33 @@ fn read_text(path: PathBuf) -> String {
 }
 
 fn run_tiny(out_dir: &Path, config_dir: &Path, extra_args: &[&str]) -> Output {
+    run_tiny_with_paths(
+        &tiny_fixture("query.fa"),
+        &tiny_fixture("transcriptome.fa"),
+        &tiny_fixture("genome.fa"),
+        out_dir,
+        config_dir,
+        extra_args,
+    )
+}
+
+fn run_tiny_with_paths(
+    query: &Path,
+    transcriptome: &Path,
+    genome: &Path,
+    out_dir: &Path,
+    config_dir: &Path,
+    extra_args: &[&str],
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kmerators"));
     command
         .env("XDG_CONFIG_HOME", config_dir)
         .arg("-f")
-        .arg(tiny_fixture("query.fa"))
+        .arg(query)
         .arg("--transcriptome-fasta")
-        .arg(tiny_fixture("transcriptome.fa"))
+        .arg(transcriptome)
         .arg("-g")
-        .arg(tiny_fixture("genome.fa"))
+        .arg(genome)
         .arg("-S")
         .arg("toy_species")
         .arg("-r")
@@ -41,6 +60,25 @@ fn run_tiny(out_dir: &Path, config_dir: &Path, extra_args: &[&str]) -> Output {
         .arg("-y");
     command.args(extra_args);
     command.output().expect("failed to run kmerators")
+}
+
+fn write_gzip(path: &Path, bytes: &[u8]) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap();
+}
+
+fn write_zstd(path: &Path, bytes: &[u8]) {
+    let compressed = zstd::stream::encode_all(bytes, 0).unwrap();
+    std::fs::write(path, compressed).unwrap();
+}
+
+fn write_xz(path: &Path, bytes: &[u8]) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut encoder = liblzma::write::XzEncoder::new(file, 6);
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap();
 }
 
 fn assert_success(output: Output) {
@@ -151,4 +189,44 @@ fn tiny_fasta_cli_repeated_k_writes_per_k_outputs() {
     let report = read_text(out_dir.join("report.md"));
     assert!(report.contains("k=5: q1: q1 - kmers/contigs: 2/2 (fasta)"));
     assert!(report.contains("k=6: q1: q1 - kmers/contigs: 3/2 (fasta)"));
+}
+
+#[test]
+fn tiny_fasta_cli_accepts_gzip_zstd_and_xz_inputs() {
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let out_dir = tmp.path().join("out");
+    let config_dir = tmp.path().join("xdg");
+    let query = tmp.path().join("query.fa.gz");
+    let transcriptome = tmp.path().join("transcriptome.fa.zst");
+    let genome = tmp.path().join("genome.fa.xz");
+
+    write_gzip(
+        &query,
+        std::fs::read(tiny_fixture("query.fa")).unwrap().as_slice(),
+    );
+    write_zstd(
+        &transcriptome,
+        std::fs::read(tiny_fixture("transcriptome.fa"))
+            .unwrap()
+            .as_slice(),
+    );
+    write_xz(
+        &genome,
+        std::fs::read(tiny_fixture("genome.fa")).unwrap().as_slice(),
+    );
+
+    assert_success(run_tiny_with_paths(
+        &query,
+        &transcriptome,
+        &genome,
+        &out_dir,
+        &config_dir,
+        &[],
+    ));
+
+    for name in ["kmers.fa", "contigs.fa", "masked.fa"] {
+        let expected = read_text(tiny_fixture(&format!("expected/{name}")));
+        let actual = read_text(out_dir.join(name));
+        assert_eq!(actual, expected, "{name} did not match the toy fixture");
+    }
 }

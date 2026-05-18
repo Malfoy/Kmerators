@@ -16,7 +16,7 @@ crossbeam-channel = "0.5"
 dirs = "6.0"
 flate2 = "1.1"
 hashbrown = { version = "0.16", features = ["serde"] }
-helicase = { version = "0.1.1", features = ["packed-seq"] }
+helicase = { version = "0.1.1", default-features = false, features = ["packed-seq", "gz", "zstd", "xz"] }
 num_cpus = "1.17"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -24,6 +24,10 @@ simd-minimizers = "2.3"
 tempfile = "3.23"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "local-offset"] }
+
+[dev-dependencies]
+liblzma = "0.4.5"
+zstd = "0.13"
 
 [features]
 default = ["portable"]

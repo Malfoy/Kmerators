@@ -298,18 +298,16 @@ fn load_transcriptome_fasta(
     records_by_id: &mut HashMap<String, Vec<u8>>,
 ) -> Result<()> {
     let bytes = get_bytes(url)?;
-    let mut decoder = GzDecoder::new(bytes.as_slice());
-    let mut fasta = Vec::new();
-    decoder
-        .read_to_end(&mut fasta)
-        .with_context(|| format!("failed to decompress {url}"))?;
-
     let tmp = tempfile::Builder::new()
-        .suffix(".fa")
+        .suffix(".fa.gz")
         .tempfile()
-        .context("failed to create temporary transcriptome FASTA")?;
-    std::fs::write(tmp.path(), &fasta)
-        .with_context(|| format!("failed to write temporary FASTA {}", tmp.path().display()))?;
+        .context("failed to create temporary compressed transcriptome FASTA")?;
+    std::fs::write(tmp.path(), &bytes).with_context(|| {
+        format!(
+            "failed to write temporary compressed FASTA {}",
+            tmp.path().display()
+        )
+    })?;
 
     for rec in fastx::read_records(tmp.path())? {
         let fields = rec

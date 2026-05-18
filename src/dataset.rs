@@ -266,3 +266,43 @@ fn parse_dataset_filename(name: &str) -> Option<(&str, &str, &str)> {
     }
     Some((species, assembly, release))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcriptome_lookup_is_case_insensitive() {
+        let transcriptome = Transcriptome::new(vec![TranscriptRecord {
+            id: "ENST0001".to_string(),
+            seq: b"ACGT".to_vec(),
+        }]);
+
+        assert_eq!(transcriptome.get("enst0001"), Some(&b"ACGT"[..]));
+        assert_eq!(transcriptome.get("missing"), None);
+    }
+
+    #[test]
+    fn dataset_basename_joins_species_assembly_and_release() {
+        assert_eq!(
+            dataset_basename("homo_sapiens", "GRCh38", "112"),
+            "homo_sapiens.GRCh38.112"
+        );
+    }
+
+    #[test]
+    fn parse_dataset_filename_accepts_only_dataset_bins() {
+        assert_eq!(
+            parse_dataset_filename("homo_sapiens.GRCh38.112.dataset.bin"),
+            Some(("homo_sapiens", "GRCh38", "112"))
+        );
+        assert_eq!(
+            parse_dataset_filename("homo_sapiens.GRCh38.112.report.md"),
+            None
+        );
+        assert_eq!(
+            parse_dataset_filename("homo_sapiens.GRCh38.112.extra.dataset.bin"),
+            None
+        );
+    }
+}
