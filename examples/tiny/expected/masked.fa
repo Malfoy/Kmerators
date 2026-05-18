@@ -1,0 +1,6 @@
+>q1.kmer1 genome:2 transcriptome:0
+ACGTA
+>q1.kmer3 genome:0 transcriptome:1
+GTACC
+>q1.kmer4 genome:0 transcriptome:1
+TACCC

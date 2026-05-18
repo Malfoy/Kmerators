@@ -1,0 +1,8 @@
+/target/
+/.venv-parity/
+/kmerator-data/
+/kmerators-data/
+
+/examples/tiny/out/
+/examples/tiny/out-multi/
+/experiments/*/work/
