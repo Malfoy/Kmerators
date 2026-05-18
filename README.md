@@ -1,13 +1,13 @@
-# kmerator-rs
+# KmeratoRS
 
-Find specific k-mers from genes, transcripts, or local FASTA/FASTQ queries
-without Jellyfish.
+Efficiently find specific k-mers from genes, transcripts, or local FASTA/FASTQ
+queries.
 
 ## Install
 
 You need Rust with Cargo.
 
-Install directly from GitHub:
+You can install it directly:
 
 ```sh
 cargo install --git https://github.com/Malfoy/Kmerators.git --locked --bin kmerators
@@ -84,7 +84,6 @@ The `-r 1` value keeps this local-file command offline. If `-r` is omitted, the
 default release is `last`, which asks Ensembl for the current release.
 
 FASTA/FASTQ inputs can be plain text or compressed as `.gz`, `.zst`, or `.xz`.
-Parsing is handled by `helicase` in all cases.
 
 Results are written to `output/`:
 
@@ -151,13 +150,12 @@ read and text after `#` is treated as a comment.
 
 ## Requirements
 
-- Rust toolchain with Cargo.
+- Rust toolchain with Cargo. If Rust is not installed yet, use the official
+  [Rust installation guide](https://www.rust-lang.org/tools/install).
 - A reference genome FASTA/FASTQ for extraction runs. Plain, `.gz`, `.zst`, and
   `.xz` inputs are accepted.
 - Internet access only for Ensembl-backed commands that use `-r last`,
   `--mk-dataset`, `--update-dataset`, `--last-avail`, or `--info`.
-
-Jellyfish is not required for the Rust extraction path.
 
 ## Build Without Installing
 
@@ -221,13 +219,34 @@ bash examples/tiny/run.sh
 ```
 
 Additional Python/Rust parity experiments live under `experiments/`. They are
-useful for compatibility checks, but they require the Python `kmerator`
-implementation and a Jellyfish binary.
+useful for compatibility checks against the legacy Python implementation.
 
-## Implementation Notes
+## Algorithm Overview
 
-The Rust version keeps the Python CLI shape and output style. FASTA/FASTQ input
-is parsed with `helicase`; plain, gzip, zstd, and xz streams are detected
-automatically. Query k-mers use exact `u64` keys for `k <= 31`; larger k values
-use fixed `u64` hashes. K-mers are routed by minimizer into hash tables for
-parallel counting.
+KmeratoRS starts from the query sequences instead of building a complete
+reference k-mer database. It enumerates the query k-mers, partitions them by
+minimizer, then streams the transcriptome and genome to count only the k-mers
+that could match the query index.
+
+```mermaid
+flowchart LR
+  Q[Query FASTA/FASTQ] --> E[Enumerate query k-mers]
+  E --> I[Build minimizer-partitioned indexes]
+  T[Transcriptome] --> CT[Stream and count transcriptome hits]
+  G[Genome] --> CG[Stream and count genome hits]
+  I --> CT
+  I --> CG
+  CT --> F[Apply specificity thresholds]
+  CG --> F
+  F --> O[kmers.fa / contigs.fa / masked.fa / report.md]
+```
+
+For each requested k-mer length, the query k-mers are represented as exact
+two-bit `u64` keys when `k <= 31`. Larger k values use fixed-size hashes. The
+minimizer partition gives each k-mer a small lookup target, so reference scans
+can skip work when a sequence block has no active minimizer partition.
+
+The same run can evaluate several `-k` values. Query sequences and datasets are
+loaded once, while transcriptome and genome scans update all requested indexes
+for that counting phase. Retained k-mers are then merged into contigs, rejected
+k-mers are written with their counts, and `report.md` summarizes the outcome.
