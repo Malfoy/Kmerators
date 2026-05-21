@@ -9,6 +9,7 @@ use hashbrown::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ItemKind {
@@ -48,7 +49,7 @@ struct SpecificRun {
 }
 
 pub fn extract_specific_kmers(args: &Args) -> Result<()> {
-    eprintln!("Load dataset {} / release {}", args.specie, args.release);
+    let total_timer = PhaseTimer::start("Total extraction");
     if args.debug {
         let k_specs = args
             .kmer_specs
@@ -67,98 +68,198 @@ pub fn extract_specific_kmers(args: &Args) -> Result<()> {
                 .unwrap_or_else(|| "<auto>".to_string())
         );
     }
-    let dataset = if let Some(path) = &args.transcriptome_fasta {
-        load_local_transcriptome_dataset(args, path)?
-    } else {
-        dataset::load_dataset(args)?
+
+    let dataset = {
+        let timer = PhaseTimer::start(format!(
+            "Load dataset {} / release {}",
+            args.specie, args.release
+        ));
+        let dataset = if let Some(path) = &args.transcriptome_fasta {
+            load_local_transcriptome_dataset(args, path)?
+        } else {
+            dataset::load_dataset(args)?
+        };
+        timer.finish();
+        dataset
     };
     let mut base_report = RunReport::default();
 
-    let items = if !args.selection.is_empty() {
-        resolve_selection(args, &dataset, &mut base_report)?
-    } else {
-        load_fasta_items(args, &mut base_report)?
+    let items = {
+        let timer = PhaseTimer::start("Resolve query sequences");
+        let items = if !args.selection.is_empty() {
+            resolve_selection(args, &dataset, &mut base_report)?
+        } else {
+            load_fasta_items(args, &mut base_report)?
+        };
+        timer.finish();
+        items
     };
     if items.is_empty() {
         bail!("no usable query sequence");
     }
 
-    eprintln!("Build query k-mer indexes");
-    let mut runs = prepare_specific_runs(args, &items, &base_report)?;
+    let mut runs = {
+        let timer = PhaseTimer::start("Build query k-mer occurrences");
+        let runs = prepare_specific_runs(args, &items, &base_report)?;
+        timer.finish();
+        runs
+    };
     if runs.iter().all(|run| run.occurrences.is_empty()) {
         bail!("no query k-mers could be generated for requested k-mer lengths");
     }
 
-    eprintln!("Count query k-mers in transcriptome");
-    let tr_indexes = runs
-        .iter()
-        .map(|run| {
-            let seeds = seeds_for_occurrences(run.spec, &items, &run.occurrences);
-            Arc::new(CountIndex::new(
-                run.spec.kmer_length,
-                run.spec.minimizer_length,
-                args.hash_table_count,
-                CountKey::Forward,
-                &seeds,
-            ))
-        })
-        .collect::<Vec<_>>();
-    let tr_counts = count::count_transcriptome_records_many(
-        &dataset.transcriptome.records,
-        tr_indexes,
-        args.thread,
-    );
+    let tr_indexes = {
+        let timer = PhaseTimer::start("Build transcriptome count indexes");
+        let indexes = runs
+            .iter()
+            .map(|run| {
+                let seeds = seeds_for_occurrences(run.spec, &items, &run.occurrences);
+                Arc::new(CountIndex::new(
+                    run.spec.kmer_length,
+                    run.spec.minimizer_length,
+                    args.hash_table_count,
+                    CountKey::Forward,
+                    &seeds,
+                ))
+            })
+            .collect::<Vec<_>>();
+        timer.finish();
+        indexes
+    };
+    let tr_counts = {
+        let timer = PhaseTimer::start("Count query k-mers in transcriptome");
+        let counts = count::count_transcriptome_records_many(
+            &dataset.transcriptome.records,
+            tr_indexes,
+            args.thread,
+        );
+        timer.finish();
+        counts
+    };
 
-    eprintln!("Count query k-mers in genome");
     let genome = args.genome.as_ref().context("--genome is required")?;
-    let ge_indexes = runs
-        .iter()
-        .map(|run| {
-            let seeds = seeds_for_occurrences(run.spec, &items, &run.occurrences);
-            Arc::new(CountIndex::new(
-                run.spec.kmer_length,
-                run.spec.minimizer_length,
-                args.hash_table_count,
-                CountKey::Canonical,
-                &seeds,
-            ))
-        })
-        .collect::<Vec<_>>();
-    let ge_counts = count::count_path_many(genome, ge_indexes, args.thread)?;
+    let ge_indexes = {
+        let timer = PhaseTimer::start("Build genome count indexes");
+        let indexes = runs
+            .iter()
+            .map(|run| {
+                let seeds = seeds_for_occurrences(run.spec, &items, &run.occurrences);
+                Arc::new(CountIndex::new(
+                    run.spec.kmer_length,
+                    run.spec.minimizer_length,
+                    args.hash_table_count,
+                    CountKey::Canonical,
+                    &seeds,
+                ))
+            })
+            .collect::<Vec<_>>();
+        timer.finish();
+        indexes
+    };
+    let ge_counts = {
+        let timer = PhaseTimer::start("Count query k-mers in genome");
+        let counts = count::count_path_many(genome, ge_indexes, args.thread)?;
+        timer.finish();
+        counts
+    };
 
-    for ((run, tr_counts), ge_counts) in runs.iter_mut().zip(tr_counts).zip(ge_counts) {
-        for (idx, occ) in run.occurrences.iter_mut().enumerate() {
-            occ.transcriptome_count = tr_counts[idx];
-            occ.genome_count = ge_counts[idx];
+    {
+        let timer = PhaseTimer::start("Assign k-mer counts");
+        for ((run, tr_counts), ge_counts) in runs.iter_mut().zip(tr_counts).zip(ge_counts) {
+            for (idx, occ) in run.occurrences.iter_mut().enumerate() {
+                occ.transcriptome_count = tr_counts[idx];
+                occ.genome_count = ge_counts[idx];
+            }
+        }
+        timer.finish();
+    }
+
+    {
+        let timer = PhaseTimer::start("Annotate isoform counts");
+        for run in &mut runs {
+            annotate_isoform_counts(run.spec, &dataset, &items, &mut run.occurrences)?;
+        }
+        timer.finish();
+    }
+
+    {
+        let timer = PhaseTimer::start("Write output files");
+        std::fs::create_dir_all(&args.output)
+            .with_context(|| format!("failed to create {}", args.output.display()))?;
+        for run in &mut runs {
+            let output_timer =
+                PhaseTimer::start(format!("Write output for k={}", run.spec.kmer_length));
+            write_run_outputs(args, &items, run)?;
+            output_timer.finish();
+        }
+        timer.finish();
+    }
+
+    let printed_report = {
+        let timer = PhaseTimer::start("Write summary report");
+        let printed_report = if runs.len() == 1 {
+            runs[0].report.clone()
+        } else {
+            let report = summarize_runs(&runs);
+            output::write_markdown_report(
+                &args.output.join("report.md"),
+                &format!("kmerators v{VERSION}; k={}", format_k_list(&runs)),
+                &args.specie,
+                &args.release,
+                &report,
+            )?;
+            report
+        };
+        timer.finish();
+        printed_report
+    };
+    output::print_report(&printed_report);
+    total_timer.finish();
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PhaseTimer {
+    label: String,
+    start: Instant,
+    finished: bool,
+}
+
+impl PhaseTimer {
+    fn start(label: impl Into<String>) -> Self {
+        let label = label.into();
+        eprintln!("{label}...");
+        Self {
+            label,
+            start: Instant::now(),
+            finished: false,
         }
     }
 
-    for run in &mut runs {
-        annotate_isoform_counts(run.spec, &dataset, &items, &mut run.occurrences)?;
+    fn finish(mut self) {
+        self.finished = true;
+        eprintln!(
+            "{} done in {}",
+            self.label,
+            format_duration(self.start.elapsed())
+        );
     }
+}
 
-    eprintln!("Write output");
-    std::fs::create_dir_all(&args.output)
-        .with_context(|| format!("failed to create {}", args.output.display()))?;
-    for run in &mut runs {
-        write_run_outputs(args, &items, run)?;
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        if !self.finished {
+            eprintln!(
+                "{} failed after {}",
+                self.label,
+                format_duration(self.start.elapsed())
+            );
+        }
     }
+}
 
-    let printed_report = if runs.len() == 1 {
-        runs[0].report.clone()
-    } else {
-        let report = summarize_runs(&runs);
-        output::write_markdown_report(
-            &args.output.join("report.md"),
-            &format!("kmerators v{VERSION}; k={}", format_k_list(&runs)),
-            &args.specie,
-            &args.release,
-            &report,
-        )?;
-        report
-    };
-    output::print_report(&printed_report);
-    Ok(())
+fn format_duration(duration: Duration) -> String {
+    format!("{:.3}s", duration.as_secs_f64())
 }
 
 fn load_local_transcriptome_dataset(args: &Args, path: &std::path::Path) -> Result<Dataset> {
