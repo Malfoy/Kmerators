@@ -25,9 +25,9 @@ pub enum CountKey {
 }
 
 #[derive(Debug)]
-pub struct QuerySeed {
+pub struct QuerySeed<'a> {
     pub id: usize,
-    pub seq: Vec<u8>,
+    pub seq: &'a [u8],
     pub forward_key: u64,
     pub canonical_key: u64,
 }
@@ -49,7 +49,7 @@ impl CountIndex {
         m: usize,
         hash_table_count: usize,
         key_kind: CountKey,
-        seeds: &[QuerySeed],
+        seeds: &[QuerySeed<'_>],
     ) -> Self {
         let key_mode = KeyMode::for_k(k);
         let mut index = Self {
@@ -65,17 +65,17 @@ impl CountIndex {
         for seed in seeds {
             match key_kind {
                 CountKey::Forward => {
-                    if let Some(minimizer) = scalar_minimizer(&seed.seq, m) {
+                    if let Some(minimizer) = scalar_minimizer(seed.seq, m) {
                         index.insert(minimizer, seed.forward_key, seed.id);
                     }
-                    index.insert_simd_minimizers(&seed.seq);
+                    index.insert_simd_minimizers(seed.seq);
                 }
                 CountKey::Canonical => {
-                    if let Some(minimizer) = scalar_minimizer(&seed.seq, m) {
+                    if let Some(minimizer) = scalar_minimizer(seed.seq, m) {
                         index.insert(minimizer, seed.canonical_key, seed.id);
                     }
-                    index.insert_simd_minimizers(&seed.seq);
-                    if let Some(rc) = kmer::revcomp(&seed.seq) {
+                    index.insert_simd_minimizers(seed.seq);
+                    if let Some(rc) = kmer::revcomp(seed.seq) {
                         if let Some(minimizer) = scalar_minimizer(&rc, m) {
                             index.insert(minimizer, seed.canonical_key, seed.id);
                         }
@@ -388,11 +388,11 @@ mod tests {
     use crate::dataset::TranscriptRecord;
     use std::sync::Arc;
 
-    fn seed(id: usize, seq: &[u8]) -> QuerySeed {
+    fn seed<'a>(id: usize, seq: &'a [u8]) -> QuerySeed<'a> {
         let mode = KeyMode::for_k(seq.len());
         QuerySeed {
             id,
-            seq: seq.to_vec(),
+            seq,
             forward_key: kmer::forward_key(seq, mode).unwrap(),
             canonical_key: kmer::canonical_key(seq, mode).unwrap(),
         }

@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
+use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const FASTA_BUFFER_CAPACITY: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct RunReport {
@@ -10,25 +13,47 @@ pub struct RunReport {
     pub warning: Vec<String>,
 }
 
-pub fn write_fasta(path: &Path, records: &[(String, Vec<u8>)]) -> Result<()> {
-    if records.is_empty() {
-        return Ok(());
+pub struct LazyFastaWriter {
+    path: PathBuf,
+    writer: Option<BufWriter<File>>,
+}
+
+impl LazyFastaWriter {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path, writer: None }
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    for (header, seq) in records {
+
+    pub fn write_record(&mut self, header: &str, seq: &[u8]) -> Result<()> {
+        let writer = self.ensure_writer()?;
         writer.write_all(b">")?;
         writer.write_all(header.as_bytes())?;
         writer.write_all(b"\n")?;
         writer.write_all(seq)?;
         writer.write_all(b"\n")?;
+        Ok(())
     }
-    Ok(())
+
+    pub fn finish(&mut self) -> Result<()> {
+        if let Some(writer) = &mut self.writer {
+            writer
+                .flush()
+                .with_context(|| format!("failed to flush {}", self.path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_writer(&mut self) -> Result<&mut BufWriter<File>> {
+        if self.writer.is_none() {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            let file = File::create(&self.path)
+                .with_context(|| format!("failed to create {}", self.path.display()))?;
+            self.writer = Some(BufWriter::with_capacity(FASTA_BUFFER_CAPACITY, file));
+        }
+        Ok(self.writer.as_mut().expect("writer just initialized"))
+    }
 }
 
 pub fn print_report(report: &RunReport) {

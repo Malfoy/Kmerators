@@ -17,6 +17,7 @@ cargo run --release --bin kmerators --manifest-path "${ROOT_DIR}/Cargo.toml" -- 
   -k 5 \
   -m 3 \
   --hash-tables 64 \
+  --write-kmers \
   -o "${OUT_DIR}" \
   -t 2 \
   -y

@@ -70,6 +70,10 @@ pub struct Cli {
     #[arg(short = 'o', long = "output")]
     pub output: Option<PathBuf>,
 
+    /// Write retained k-mers to kmers.fa. Disabled by default; contigs and masked k-mers are still written.
+    #[arg(long = "write-kmers", alias = "output-kmers")]
+    pub write_kmers: bool,
+
     /// Worker thread count.
     #[arg(short = 't', long = "thread")]
     pub thread: Option<usize>,
@@ -156,6 +160,7 @@ pub struct Args {
     pub max_on_transcriptome: u32,
     pub max_on_genome: u32,
     pub output: PathBuf,
+    pub write_kmers: bool,
     pub thread: usize,
     pub tmpdir: Option<PathBuf>,
     pub debug: bool,
@@ -221,6 +226,7 @@ impl Args {
             .unwrap_or(1);
 
         let stringent = cli.stringent || cfg.bool("stringent").unwrap_or(false);
+        let write_kmers = cli.write_kmers || cfg.bool("write_kmers").unwrap_or(false);
         let keep = cli.keep || cfg.bool("keep").unwrap_or(false);
         let yes = cli.yes || cfg.bool("yes").unwrap_or(false);
 
@@ -239,6 +245,7 @@ impl Args {
             max_on_transcriptome,
             max_on_genome,
             output,
+            write_kmers,
             thread,
             tmpdir: cli.tmpdir,
             debug: cli.debug,
@@ -447,6 +454,7 @@ mod tests {
             max_on_transcriptome: None,
             max_on_genome: None,
             output: None,
+            write_kmers: false,
             thread: None,
             tmpdir: None,
             debug: false,

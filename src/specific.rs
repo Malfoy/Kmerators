@@ -31,7 +31,6 @@ struct QueryItem {
 struct Occurrence {
     item_idx: usize,
     pos: usize,
-    seq: Vec<u8>,
     forward_key: u64,
     canonical_key: u64,
     transcriptome_count: u32,
@@ -46,8 +45,6 @@ struct SpecificRun {
     report: RunReport,
     occurrences: Vec<Occurrence>,
 }
-
-type FastaRecords = Vec<(String, Vec<u8>)>;
 
 pub fn extract_specific_kmers(args: &Args) -> Result<()> {
     eprintln!("Load dataset {} / release {}", args.specie, args.release);
@@ -91,22 +88,17 @@ pub fn extract_specific_kmers(args: &Args) -> Result<()> {
         bail!("no query k-mers could be generated for requested k-mer lengths");
     }
 
-    let seeds_by_run = runs
-        .iter()
-        .map(|run| seeds_for_occurrences(&run.occurrences))
-        .collect::<Vec<_>>();
-
     eprintln!("Count query k-mers in transcriptome");
     let tr_indexes = runs
         .iter()
-        .zip(&seeds_by_run)
-        .map(|(run, seeds)| {
+        .map(|run| {
+            let seeds = seeds_for_occurrences(run.spec, &items, &run.occurrences);
             Arc::new(CountIndex::new(
                 run.spec.kmer_length,
                 run.spec.minimizer_length,
                 args.hash_table_count,
                 CountKey::Forward,
-                seeds,
+                &seeds,
             ))
         })
         .collect::<Vec<_>>();
@@ -120,14 +112,14 @@ pub fn extract_specific_kmers(args: &Args) -> Result<()> {
     let genome = args.genome.as_ref().context("--genome is required")?;
     let ge_indexes = runs
         .iter()
-        .zip(&seeds_by_run)
-        .map(|(run, seeds)| {
+        .map(|run| {
+            let seeds = seeds_for_occurrences(run.spec, &items, &run.occurrences);
             Arc::new(CountIndex::new(
                 run.spec.kmer_length,
                 run.spec.minimizer_length,
                 args.hash_table_count,
                 CountKey::Canonical,
-                seeds,
+                &seeds,
             ))
         })
         .collect::<Vec<_>>();
@@ -222,13 +214,17 @@ fn output_dir_for_spec(args: &Args, spec: KmerSpec, multi_k: bool) -> PathBuf {
     }
 }
 
-fn seeds_for_occurrences(occurrences: &[Occurrence]) -> Vec<QuerySeed> {
+fn seeds_for_occurrences<'a>(
+    spec: KmerSpec,
+    items: &'a [QueryItem],
+    occurrences: &[Occurrence],
+) -> Vec<QuerySeed<'a>> {
     occurrences
         .iter()
         .enumerate()
         .map(|(id, occ)| QuerySeed {
             id,
-            seq: occ.seq.clone(),
+            seq: occurrence_seq(items, occ, spec.kmer_length),
             forward_key: occ.forward_key,
             canonical_key: occ.canonical_key,
         })
@@ -236,12 +232,16 @@ fn seeds_for_occurrences(occurrences: &[Occurrence]) -> Vec<QuerySeed> {
 }
 
 fn write_run_outputs(args: &Args, items: &[QueryItem], run: &mut SpecificRun) -> Result<()> {
-    let (kmers, contigs, masked) = build_outputs(args, items, &run.occurrences, &mut run.report);
     std::fs::create_dir_all(&run.output)
         .with_context(|| format!("failed to create {}", run.output.display()))?;
-    output::write_fasta(&run.output.join("kmers.fa"), &kmers)?;
-    output::write_fasta(&run.output.join("contigs.fa"), &contigs)?;
-    output::write_fasta(&run.output.join("masked.fa"), &masked)?;
+    write_outputs(
+        args,
+        items,
+        &run.occurrences,
+        &mut run.report,
+        &run.output,
+        run.spec.kmer_length,
+    )?;
     let command = if args.kmer_specs.len() == 1 {
         format!("kmerators v{VERSION}")
     } else {
@@ -429,7 +429,6 @@ fn build_occurrences(
                 occurrences.push(Occurrence {
                     item_idx,
                     pos,
-                    seq: chunk[offset..offset + kmer_length].to_vec(),
                     forward_key,
                     canonical_key,
                     transcriptome_count: 0,
@@ -516,21 +515,35 @@ fn isoform_presence_counts(
     counts
 }
 
-fn build_outputs(
+fn write_outputs(
     args: &Args,
     items: &[QueryItem],
     occurrences: &[Occurrence],
     report: &mut RunReport,
-) -> (FastaRecords, FastaRecords, FastaRecords) {
-    let mut kmers = Vec::new();
-    let mut contigs = Vec::new();
-    let mut masked = Vec::new();
+    output_dir: &std::path::Path,
+    kmer_length: usize,
+) -> Result<()> {
+    debug_assert!(
+        occurrences
+            .windows(2)
+            .all(|pair| pair[0].item_idx <= pair[1].item_idx),
+        "occurrences must be grouped by query item"
+    );
+
+    let mut kmers = args
+        .write_kmers
+        .then(|| output::LazyFastaWriter::new(output_dir.join("kmers.fa")));
+    let mut contigs = output::LazyFastaWriter::new(output_dir.join("contigs.fa"));
+    let mut masked = output::LazyFastaWriter::new(output_dir.join("masked.fa"));
+    let mut occurrence_idx = 0usize;
 
     for (item_idx, item) in items.iter().enumerate() {
-        let item_occs = occurrences
-            .iter()
-            .filter(|occ| occ.item_idx == item_idx)
-            .collect::<Vec<_>>();
+        let item_start = occurrence_idx;
+        while occurrence_idx < occurrences.len() && occurrences[occurrence_idx].item_idx == item_idx
+        {
+            occurrence_idx += 1;
+        }
+        let item_occs = &occurrences[item_start..occurrence_idx];
         if item_occs.is_empty() {
             continue;
         }
@@ -542,34 +555,38 @@ fn build_outputs(
         let mut last_pos = 0usize;
 
         for occ in item_occs {
+            let seq = occurrence_seq(items, occ, kmer_length);
             if is_specific(args, item, occ) {
                 specific_count += 1;
                 if current_contig.is_empty() || occ.pos != last_pos + 1 {
                     if !current_contig.is_empty() {
-                        contigs.push((
-                            contig_header(item, current_contig_no, contig_start),
-                            std::mem::take(&mut current_contig),
-                        ));
+                        contigs.write_record(
+                            &contig_header(item, current_contig_no, contig_start),
+                            &current_contig,
+                        )?;
                     }
                     contig_count += 1;
                     current_contig_no = contig_count;
                     contig_start = occ.pos;
-                    current_contig = occ.seq.clone();
+                    current_contig.clear();
+                    current_contig.extend_from_slice(seq);
                 } else {
-                    current_contig.push(*occ.seq.last().expect("k-mer is non-empty"));
+                    current_contig.push(*seq.last().expect("k-mer is non-empty"));
                 }
                 last_pos = occ.pos;
-                kmers.push((kmer_header(item, occ, current_contig_no), occ.seq.clone()));
+                if let Some(kmers) = &mut kmers {
+                    kmers.write_record(&kmer_header(item, occ, current_contig_no), seq)?;
+                }
             } else {
-                masked.push((masked_header(item, occ), occ.seq.clone()));
+                masked.write_record(&masked_header(item, occ), seq)?;
             }
         }
 
         if !current_contig.is_empty() {
-            contigs.push((
-                contig_header(item, current_contig_no, contig_start),
-                current_contig,
-            ));
+            contigs.write_record(
+                &contig_header(item, current_contig_no, contig_start),
+                &current_contig,
+            )?;
         }
 
         if specific_count == 0 {
@@ -588,7 +605,17 @@ fn build_outputs(
         }
     }
 
-    (kmers, contigs, masked)
+    if let Some(kmers) = &mut kmers {
+        kmers.finish()?;
+    }
+    contigs.finish()?;
+    masked.finish()?;
+    Ok(())
+}
+
+fn occurrence_seq<'a>(items: &'a [QueryItem], occ: &Occurrence, kmer_length: usize) -> &'a [u8] {
+    let start = occ.pos - 1;
+    &items[occ.item_idx].seq[start..start + kmer_length]
 }
 
 fn is_specific(args: &Args, item: &QueryItem, occ: &Occurrence) -> bool {
@@ -791,6 +818,7 @@ mod tests {
             max_on_transcriptome: 0,
             max_on_genome: 10,
             output: output.clone(),
+            write_kmers: true,
             thread: 2,
             tmpdir: None,
             debug: false,

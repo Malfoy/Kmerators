@@ -42,6 +42,9 @@ const DEFAULT_CONFIG: &str = r#"[CMD_ARGS]
 ## output directory
 # output = ./output
 
+## --write-kmers option: also write retained k-mers to kmers.fa
+# write_kmers = false
+
 ## assumes yes as prompt answer
 # yes = false
 

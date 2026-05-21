@@ -52,8 +52,8 @@ Tiny example passed.
 ```
 
 The tiny example is fully offline. It builds the tool, runs it on checked-in
-FASTA files, and verifies `kmers.fa`, `contigs.fa`, and `masked.fa` against
-expected outputs.
+FASTA files, enables `--write-kmers`, and verifies `kmers.fa`, `contigs.fa`,
+and `masked.fa` against expected outputs.
 
 ## What Files Do I Need?
 
@@ -87,10 +87,12 @@ FASTA/FASTQ inputs can be plain text or compressed as `.gz`, `.zst`, or `.xz`.
 
 Results are written to `output/`:
 
-- `kmers.fa`: retained specific k-mers
 - `contigs.fa`: adjacent retained k-mers merged into contigs
 - `masked.fa`: rejected query k-mers with genome/transcriptome counts
 - `report.md`: run summary
+
+Use `--write-kmers` when you also need `kmers.fa`, which contains one FASTA
+record per retained k-mer position.
 
 Start by checking `output/report.md`; it lists completed, failed, ambiguous, and
 warning cases for the run.
@@ -186,12 +188,14 @@ kmerators ... \
   --hash-tables 1024 \
   --max-on-transcriptome 0 \
   --max-on-genome 1 \
+  --write-kmers \
   -t 16
 ```
 
 - `-k, --kmer-length`: k-mer length; repeatable; default `31`
 - `-m, --minimizer-length`: minimizer length; default `min(9, k)` for each k
 - `--hash-tables`: minimizer-routed hash table count; default `1024`
+- `--write-kmers`: write retained k-mers to `kmers.fa`; disabled by default
 - `-t, --thread`: worker thread count; default is available CPU count
 - `--tmpdir`: temporary directory
 - `--keep`: keep intermediate files where applicable
@@ -238,7 +242,7 @@ flowchart LR
   I --> CG
   CT --> F[Apply specificity thresholds]
   CG --> F
-  F --> O[kmers.fa / contigs.fa / masked.fa / report.md]
+  F --> O[contigs.fa / masked.fa / optional kmers.fa / report.md]
 ```
 
 For each requested k-mer length, the query k-mers are represented as exact

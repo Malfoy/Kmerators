@@ -91,14 +91,15 @@ fn assert_success(output: Output) {
 }
 
 #[test]
-fn tiny_fasta_cli_matches_expected_outputs() {
+fn tiny_fasta_cli_defaults_to_no_kmer_file() {
     let tmp = tempfile::tempdir().expect("failed to create tempdir");
     let out_dir = tmp.path().join("out");
     let config_dir = tmp.path().join("xdg");
 
     assert_success(run_tiny(&out_dir, &config_dir, &[]));
 
-    for name in ["kmers.fa", "contigs.fa", "masked.fa"] {
+    assert!(!out_dir.join("kmers.fa").exists());
+    for name in ["contigs.fa", "masked.fa"] {
         let expected = read_text(tiny_fixture(&format!("expected/{name}")));
         let actual = read_text(out_dir.join(name));
         assert_eq!(actual, expected, "{name} did not match the toy fixture");
@@ -106,6 +107,21 @@ fn tiny_fasta_cli_matches_expected_outputs() {
 
     let report = read_text(out_dir.join("report.md"));
     assert!(report.contains("q1: q1 - kmers/contigs: 2/2 (fasta)"));
+}
+
+#[test]
+fn tiny_fasta_cli_writes_kmers_when_requested() {
+    let tmp = tempfile::tempdir().expect("failed to create tempdir");
+    let out_dir = tmp.path().join("out");
+    let config_dir = tmp.path().join("xdg");
+
+    assert_success(run_tiny(&out_dir, &config_dir, &["--write-kmers"]));
+
+    for name in ["kmers.fa", "contigs.fa", "masked.fa"] {
+        let expected = read_text(tiny_fixture(&format!("expected/{name}")));
+        let actual = read_text(out_dir.join(name));
+        assert_eq!(actual, expected, "{name} did not match the toy fixture");
+    }
 }
 
 #[test]
@@ -117,7 +133,7 @@ fn tiny_fasta_cli_honors_transcriptome_threshold() {
     assert_success(run_tiny(
         &out_dir,
         &config_dir,
-        &["--max-on-transcriptome", "1"],
+        &["--write-kmers", "--max-on-transcriptome", "1"],
     ));
 
     assert_eq!(
@@ -152,7 +168,11 @@ fn tiny_fasta_cli_repeated_k_writes_per_k_outputs() {
     let out_dir = tmp.path().join("out");
     let config_dir = tmp.path().join("xdg");
 
-    assert_success(run_tiny(&out_dir, &config_dir, &["-k", "6"]));
+    assert_success(run_tiny(
+        &out_dir,
+        &config_dir,
+        &["--write-kmers", "-k", "6"],
+    ));
 
     assert!(!out_dir.join("kmers.fa").exists());
     for name in ["kmers.fa", "contigs.fa", "masked.fa"] {
@@ -221,7 +241,7 @@ fn tiny_fasta_cli_accepts_gzip_zstd_and_xz_inputs() {
         &genome,
         &out_dir,
         &config_dir,
-        &[],
+        &["--write-kmers"],
     ));
 
     for name in ["kmers.fa", "contigs.fa", "masked.fa"] {
