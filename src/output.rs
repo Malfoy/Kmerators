@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-const FASTA_BUFFER_CAPACITY: usize = 1024 * 1024;
+const FASTA_BUFFER_CAPACITY: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct RunReport {
@@ -23,10 +23,13 @@ impl LazyFastaWriter {
         Self { path, writer: None }
     }
 
-    pub fn write_record(&mut self, header: &str, seq: &[u8]) -> Result<()> {
+    pub fn write_record_with<F>(&mut self, write_header: F, seq: &[u8]) -> Result<()>
+    where
+        F: FnOnce(&mut BufWriter<File>) -> std::io::Result<()>,
+    {
         let writer = self.ensure_writer()?;
         writer.write_all(b">")?;
-        writer.write_all(header.as_bytes())?;
+        write_header(writer)?;
         writer.write_all(b"\n")?;
         writer.write_all(seq)?;
         writer.write_all(b"\n")?;

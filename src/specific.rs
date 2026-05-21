@@ -6,6 +6,7 @@ use crate::kmer::{self, KeyMode};
 use crate::output::{self, RunReport};
 use anyhow::{Context, Result, bail};
 use hashbrown::{HashMap, HashSet};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -549,8 +550,7 @@ fn write_outputs(
         }
         let mut specific_count = 0usize;
         let mut contig_count = 0usize;
-        let mut current_contig = Vec::<u8>::new();
-        let mut contig_start = 0usize;
+        let mut current_contig_start = 0usize;
         let mut current_contig_no = 0usize;
         let mut last_pos = 0usize;
 
@@ -558,34 +558,38 @@ fn write_outputs(
             let seq = occurrence_seq(items, occ, kmer_length);
             if is_specific(args, item, occ) {
                 specific_count += 1;
-                if current_contig.is_empty() || occ.pos != last_pos + 1 {
-                    if !current_contig.is_empty() {
-                        contigs.write_record(
-                            &contig_header(item, current_contig_no, contig_start),
-                            &current_contig,
+                if current_contig_start == 0 || occ.pos != last_pos + 1 {
+                    if current_contig_start != 0 {
+                        write_contig_record(
+                            &mut contigs,
+                            item,
+                            current_contig_no,
+                            current_contig_start,
+                            last_pos,
+                            kmer_length,
                         )?;
                     }
                     contig_count += 1;
                     current_contig_no = contig_count;
-                    contig_start = occ.pos;
-                    current_contig.clear();
-                    current_contig.extend_from_slice(seq);
-                } else {
-                    current_contig.push(*seq.last().expect("k-mer is non-empty"));
+                    current_contig_start = occ.pos;
                 }
                 last_pos = occ.pos;
                 if let Some(kmers) = &mut kmers {
-                    kmers.write_record(&kmer_header(item, occ, current_contig_no), seq)?;
+                    write_kmer_record(kmers, item, occ, current_contig_no, seq)?;
                 }
             } else {
-                masked.write_record(&masked_header(item, occ), seq)?;
+                write_masked_record(&mut masked, item, occ, seq)?;
             }
         }
 
-        if !current_contig.is_empty() {
-            contigs.write_record(
-                &contig_header(item, current_contig_no, contig_start),
-                &current_contig,
+        if current_contig_start != 0 {
+            write_contig_record(
+                &mut contigs,
+                item,
+                current_contig_no,
+                current_contig_start,
+                last_pos,
+                kmer_length,
             )?;
         }
 
@@ -618,6 +622,17 @@ fn occurrence_seq<'a>(items: &'a [QueryItem], occ: &Occurrence, kmer_length: usi
     &items[occ.item_idx].seq[start..start + kmer_length]
 }
 
+fn contig_seq<'a>(
+    item: &'a QueryItem,
+    contig_start: usize,
+    last_pos: usize,
+    kmer_length: usize,
+) -> &'a [u8] {
+    let start = contig_start - 1;
+    let end = last_pos + kmer_length - 1;
+    &item.seq[start..end]
+}
+
 fn is_specific(args: &Args, item: &QueryItem, occ: &Occurrence) -> bool {
     match item.kind {
         ItemKind::Gene => {
@@ -639,72 +654,193 @@ fn is_specific(args: &Args, item: &QueryItem, occ: &Occurrence) -> bool {
     }
 }
 
-fn kmer_header(item: &QueryItem, occ: &Occurrence, contig_no: usize) -> String {
+fn write_kmer_record(
+    writer: &mut output::LazyFastaWriter,
+    item: &QueryItem,
+    occ: &Occurrence,
+    contig_no: usize,
+    seq: &[u8],
+) -> Result<()> {
+    writer.write_record_with(
+        |writer| write_kmer_header(writer, item, occ, contig_no),
+        seq,
+    )
+}
+
+fn write_contig_record(
+    writer: &mut output::LazyFastaWriter,
+    item: &QueryItem,
+    contig_no: usize,
+    contig_start: usize,
+    last_pos: usize,
+    kmer_length: usize,
+) -> Result<()> {
+    let seq = contig_seq(item, contig_start, last_pos, kmer_length);
+    writer.write_record_with(
+        |writer| write_contig_header(writer, item, contig_no, contig_start),
+        seq,
+    )
+}
+
+fn write_masked_record(
+    writer: &mut output::LazyFastaWriter,
+    item: &QueryItem,
+    occ: &Occurrence,
+    seq: &[u8],
+) -> Result<()> {
+    writer.write_record_with(|writer| write_masked_header(writer, item, occ), seq)
+}
+
+fn write_kmer_header<W: Write>(
+    writer: &mut W,
+    item: &QueryItem,
+    occ: &Occurrence,
+    contig_no: usize,
+) -> io::Result<()> {
     match item.kind {
-        ItemKind::Gene => format!(
-            "{}:{}.kmer{} ct:{} tr:{}/{}",
-            item.given.to_ascii_uppercase(),
-            item.enst.as_deref().unwrap_or("NA"),
-            occ.pos,
-            contig_no,
-            occ.isoform_count,
-            item.isoform_total
-        ),
-        ItemKind::Transcript => format!(
-            "{}:{}.kmer{} ct:{}",
-            item.given.to_ascii_uppercase(),
-            item.enst.as_deref().unwrap_or(&item.id),
-            occ.pos,
-            contig_no
-        ),
-        ItemKind::Fasta => format!("{}.kmer{} ct:{}", item.id, occ.pos, contig_no),
+        ItemKind::Gene => {
+            write_ascii_uppercase(writer, &item.given)?;
+            writer.write_all(b":")?;
+            write_str(writer, item.enst.as_deref().unwrap_or("NA"))?;
+            writer.write_all(b".kmer")?;
+            write_usize(writer, occ.pos)?;
+            writer.write_all(b" ct:")?;
+            write_usize(writer, contig_no)?;
+            writer.write_all(b" tr:")?;
+            write_u32(writer, occ.isoform_count)?;
+            writer.write_all(b"/")?;
+            write_u32(writer, item.isoform_total)
+        }
+        ItemKind::Transcript => {
+            write_ascii_uppercase(writer, &item.given)?;
+            writer.write_all(b":")?;
+            write_str(writer, item.enst.as_deref().unwrap_or(&item.id))?;
+            writer.write_all(b".kmer")?;
+            write_usize(writer, occ.pos)?;
+            writer.write_all(b" ct:")?;
+            write_usize(writer, contig_no)
+        }
+        ItemKind::Fasta => {
+            write_str(writer, &item.id)?;
+            writer.write_all(b".kmer")?;
+            write_usize(writer, occ.pos)?;
+            writer.write_all(b" ct:")?;
+            write_usize(writer, contig_no)
+        }
     }
 }
 
-fn contig_header(item: &QueryItem, contig_no: usize, pos: usize) -> String {
+fn write_contig_header<W: Write>(
+    writer: &mut W,
+    item: &QueryItem,
+    contig_no: usize,
+    pos: usize,
+) -> io::Result<()> {
     match item.kind {
-        ItemKind::Gene => format!(
-            "{}:{}.contig_{} (at position {})",
-            item.given.to_ascii_uppercase(),
-            item.enst.as_deref().unwrap_or("NA"),
-            contig_no,
-            pos
-        ),
-        ItemKind::Transcript => format!(
-            "{}.contig_{} (at position {})",
-            item.enst.as_deref().unwrap_or(&item.id),
-            contig_no,
-            pos
-        ),
-        ItemKind::Fasta => format!("{}.contig_{} (at position {})", item.id, contig_no, pos),
+        ItemKind::Gene => {
+            write_ascii_uppercase(writer, &item.given)?;
+            writer.write_all(b":")?;
+            write_str(writer, item.enst.as_deref().unwrap_or("NA"))?;
+            writer.write_all(b".contig_")?;
+            write_usize(writer, contig_no)?;
+            writer.write_all(b" (at position ")?;
+            write_usize(writer, pos)?;
+            writer.write_all(b")")
+        }
+        ItemKind::Transcript => {
+            write_str(writer, item.enst.as_deref().unwrap_or(&item.id))?;
+            writer.write_all(b".contig_")?;
+            write_usize(writer, contig_no)?;
+            writer.write_all(b" (at position ")?;
+            write_usize(writer, pos)?;
+            writer.write_all(b")")
+        }
+        ItemKind::Fasta => {
+            write_str(writer, &item.id)?;
+            writer.write_all(b".contig_")?;
+            write_usize(writer, contig_no)?;
+            writer.write_all(b" (at position ")?;
+            write_usize(writer, pos)?;
+            writer.write_all(b")")
+        }
     }
 }
 
-fn masked_header(item: &QueryItem, occ: &Occurrence) -> String {
+fn write_masked_header<W: Write>(
+    writer: &mut W,
+    item: &QueryItem,
+    occ: &Occurrence,
+) -> io::Result<()> {
     match item.kind {
-        ItemKind::Gene => format!(
-            "{}:{}.kmer{} tr:{}/{} genome:{} transcriptome:{}",
-            item.given.to_ascii_uppercase(),
-            item.enst.as_deref().unwrap_or("NA"),
-            occ.pos,
-            occ.isoform_count,
-            item.isoform_total,
-            occ.genome_count,
-            occ.transcriptome_count
-        ),
-        ItemKind::Transcript => format!(
-            "{}:{}.kmer{} genome:{} transcriptome:{}",
-            item.given.to_ascii_uppercase(),
-            item.enst.as_deref().unwrap_or(&item.id),
-            occ.pos,
-            occ.genome_count,
-            occ.transcriptome_count
-        ),
-        ItemKind::Fasta => format!(
-            "{}.kmer{} genome:{} transcriptome:{}",
-            item.id, occ.pos, occ.genome_count, occ.transcriptome_count
-        ),
+        ItemKind::Gene => {
+            write_ascii_uppercase(writer, &item.given)?;
+            writer.write_all(b":")?;
+            write_str(writer, item.enst.as_deref().unwrap_or("NA"))?;
+            writer.write_all(b".kmer")?;
+            write_usize(writer, occ.pos)?;
+            writer.write_all(b" tr:")?;
+            write_u32(writer, occ.isoform_count)?;
+            writer.write_all(b"/")?;
+            write_u32(writer, item.isoform_total)?;
+            writer.write_all(b" genome:")?;
+            write_u32(writer, occ.genome_count)?;
+            writer.write_all(b" transcriptome:")?;
+            write_u32(writer, occ.transcriptome_count)
+        }
+        ItemKind::Transcript => {
+            write_ascii_uppercase(writer, &item.given)?;
+            writer.write_all(b":")?;
+            write_str(writer, item.enst.as_deref().unwrap_or(&item.id))?;
+            writer.write_all(b".kmer")?;
+            write_usize(writer, occ.pos)?;
+            writer.write_all(b" genome:")?;
+            write_u32(writer, occ.genome_count)?;
+            writer.write_all(b" transcriptome:")?;
+            write_u32(writer, occ.transcriptome_count)
+        }
+        ItemKind::Fasta => {
+            write_str(writer, &item.id)?;
+            writer.write_all(b".kmer")?;
+            write_usize(writer, occ.pos)?;
+            writer.write_all(b" genome:")?;
+            write_u32(writer, occ.genome_count)?;
+            writer.write_all(b" transcriptome:")?;
+            write_u32(writer, occ.transcriptome_count)
+        }
     }
+}
+
+fn write_str<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
+    writer.write_all(value.as_bytes())
+}
+
+fn write_usize<W: Write>(writer: &mut W, value: usize) -> io::Result<()> {
+    write_u64(writer, value as u64)
+}
+
+fn write_u32<W: Write>(writer: &mut W, value: u32) -> io::Result<()> {
+    write_u64(writer, value as u64)
+}
+
+fn write_u64<W: Write>(writer: &mut W, mut value: u64) -> io::Result<()> {
+    let mut buffer = [0u8; 20];
+    let mut idx = buffer.len();
+    loop {
+        idx -= 1;
+        buffer[idx] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    writer.write_all(&buffer[idx..])
+}
+
+fn write_ascii_uppercase<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
+    for byte in value.bytes() {
+        writer.write_all(&[byte.to_ascii_uppercase()])?;
+    }
+    Ok(())
 }
 
 fn item_kind_label(kind: ItemKind) -> &'static str {
