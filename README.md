@@ -305,13 +305,6 @@ cd kmerators-wasm
 ./scripts/build-wasm.sh
 ```
 
-This command compiles the Rust WebAssembly crate and writes the browser artifact
-to:
-
-```text
-web/wasm/kmerators_wasm_core.wasm
-```
-
 Run this script again whenever the Rust code under `kmerators-wasm/crates/`
 changes.
 
@@ -324,8 +317,7 @@ cd web
 npm install
 ```
 
-This creates `web/node_modules/`. It is a local dependency directory and should
-not be committed.
+This creates `web/node_modules/`.
 
 ### 4. Start The Local Browser App
 
