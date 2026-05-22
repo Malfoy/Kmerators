@@ -13,18 +13,18 @@
         <aside class="controls-panel">
           <div class="brand">
             <h1>kmerators-wasm</h1>
-            <p>Local FASTA specificity filtering</p>
+            <p>Local FASTA/FASTQ specificity filtering</p>
           </div>
 
           <form id="run-form" class="run-form">
             <label class="file-field">
-              <span>Query FASTA</span>
-              <input id="query-file" name="query" type="file" accept=".fa,.fasta,.fna,.txt,.gz,.zst,.zstd,.xz" required />
+              <span>Query FASTA/FASTQ</span>
+              <input id="query-file" name="query" type="file" accept=".fa,.fasta,.fna,.fq,.fastq,.txt,.gz,.zst,.zstd,.xz" required />
             </label>
 
             <label class="file-field">
-              <span>Transcriptome FASTA optional</span>
-              <input id="transcriptome-file" name="transcriptome" type="file" accept=".fa,.fasta,.fna,.txt,.gz,.zst,.zstd,.xz" />
+              <span>Transcriptome FASTA/FASTQ optional</span>
+              <input id="transcriptome-file" name="transcriptome" type="file" accept=".fa,.fasta,.fna,.fq,.fastq,.txt,.gz,.zst,.zstd,.xz" />
             </label>
             <label class="default-source">
               <input id="default-transcriptome" name="defaultTranscriptome" type="checkbox" />
@@ -32,8 +32,8 @@
             </label>
 
             <label class="file-field">
-              <span>Genome FASTA optional</span>
-              <input id="genome-file" name="genome" type="file" accept=".fa,.fasta,.fna,.txt,.gz,.zst,.zstd,.xz" />
+              <span>Genome FASTA/FASTQ optional</span>
+              <input id="genome-file" name="genome" type="file" accept=".fa,.fasta,.fna,.fq,.fastq,.txt,.gz,.zst,.zstd,.xz" />
             </label>
             <label class="default-source">
               <input id="default-genome" name="defaultGenome" type="checkbox" />
@@ -42,8 +42,8 @@
 
             <div class="param-grid">
               <label>
-                <span>k-mer</span>
-                <input id="kmer-length" name="k" type="number" min="1" max="31" value="31" required />
+                <span>k-mer sizes</span>
+                <input id="kmer-length" name="k" type="text" value="31" required />
               </label>
               <label>
                 <span>Max matches in transcriptome*</span>
@@ -64,6 +64,10 @@
               <label>
                 <span>Chunk size MB</span>
                 <input id="chunk-mb" name="chunkMb" type="number" min="1" max="64" value="4" required />
+              </label>
+              <label>
+                <span>Minimizer length</span>
+                <input id="minimizer-length" name="minimizerLength" type="number" min="1" max="31" placeholder="auto" />
               </label>
             </details>
 

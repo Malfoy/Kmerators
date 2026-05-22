@@ -13,7 +13,7 @@ self.addEventListener("message", async (event) => {
   if (event.data?.type !== "run") return;
   try {
     const result = await run(event.data.payload);
-    postMessage({ type: "result", result }, [result.contigs_zst.buffer]);
+    postMessage({ type: "result", result }, transferBuffers(result));
   } catch (error) {
     postMessage({ type: "error", message: error?.message || String(error) });
   }
@@ -22,57 +22,138 @@ self.addEventListener("message", async (event) => {
 async function run(payload) {
   wasm = await loadWasm();
   const { exports } = wasm.instance;
-  const session = exports.kmerators_session_new(
-    payload.params.k,
-    payload.params.maxTranscriptome,
-    payload.params.maxGenome,
+  const kmers = payload.params.kmers?.length ? payload.params.kmers : [payload.params.k];
+  const sessions = kmers.map((k) =>
+    createSession(k, payload.params.minimizerLength || 0, payload.params.maxTranscriptome, payload.params.maxGenome),
   );
-  if (!session) throw new Error(readLastError());
 
   try {
     postStatus("Query", payload.sources.query.name);
     const queryBytes = await readWholeFile(payload.sources.query, payload.params.chunkBytes, "query");
-    callBytes(exports.kmerators_set_query_fasta, session, queryBytes);
+    for (const session of sessions) {
+      callBytes(exports.kmerators_set_query_fastx || exports.kmerators_set_query_fasta, session, queryBytes);
+    }
 
     const transcriptomeSources = payload.sources.transcriptome || [];
     const genomeSources = payload.sources.genome || [];
-    check(exports.kmerators_set_transcriptome_enabled(session, transcriptomeSources.length ? 1 : 0));
-    check(exports.kmerators_set_genome_enabled(session, genomeSources.length ? 1 : 0));
+    for (const session of sessions) {
+      check(exports.kmerators_set_transcriptome_enabled(session, transcriptomeSources.length ? 1 : 0));
+      check(exports.kmerators_set_genome_enabled(session, genomeSources.length ? 1 : 0));
+    }
 
     if (transcriptomeSources.length) {
       await scanSources(
         transcriptomeSources,
         payload.params.chunkBytes,
         "transcriptome",
-        (bytes) => callBytes(exports.kmerators_scan_transcriptome_chunk, session, bytes),
+        (bytes) => {
+          for (const session of sessions) {
+            callBytes(exports.kmerators_scan_transcriptome_chunk, session, bytes);
+          }
+        },
+        () => {
+          for (const session of sessions) {
+            check(exports.kmerators_finish_transcriptome_source(session));
+          }
+        },
       );
     } else {
       postProgress("transcriptome", 0, 0);
     }
 
     if (genomeSources.length) {
-      await scanSources(genomeSources, payload.params.chunkBytes, "genome", (bytes) =>
-        callBytes(exports.kmerators_scan_genome_chunk, session, bytes),
+      await scanSources(
+        genomeSources,
+        payload.params.chunkBytes,
+        "genome",
+        (bytes) => {
+          for (const session of sessions) {
+            callBytes(exports.kmerators_scan_genome_chunk, session, bytes);
+          }
+        },
+        () => {
+          for (const session of sessions) {
+            check(exports.kmerators_finish_genome_source(session));
+          }
+        },
       );
     } else {
       postProgress("genome", 0, 0);
     }
 
     postStatus("Finalizing", "Building output files.");
-    check(exports.kmerators_finish(session));
-    const json = readResult(session);
-    return compressContigsOutput(JSON.parse(json));
+    const runs = [];
+    for (const session of sessions) {
+      check(exports.kmerators_finish(session));
+      runs.push(JSON.parse(readResult(session)));
+    }
+    return compressRunOutputs(combineRuns(runs, payload.params));
   } finally {
-    exports.kmerators_session_free(session);
+    for (const session of sessions) {
+      exports.kmerators_session_free(session);
+    }
   }
 }
 
-async function compressContigsOutput(result) {
+function createSession(k, minimizerLength, maxTranscriptome, maxGenome) {
+  const { exports } = wasm.instance;
+  const session = exports.kmerators_session_new_with_minimizer
+    ? exports.kmerators_session_new_with_minimizer(k, minimizerLength, maxTranscriptome, maxGenome)
+    : exports.kmerators_session_new(k, maxTranscriptome, maxGenome);
+  if (!session) throw new Error(readLastError());
+  return session;
+}
+
+async function compressRunOutputs(result) {
   await ensureZstdReady();
-  const contigs = result.files?.contigs_fa || "";
-  result.contigs_zst = zstdCompress(encoder.encode(contigs), -1);
-  delete result.files.contigs_fa;
+  for (const run of result.runs) {
+    const contigs = run.files?.contigs_fa || "";
+    run.contigs_zst = zstdCompress(encoder.encode(contigs), -1);
+    delete run.files.contigs_fa;
+  }
   return result;
+}
+
+function combineRuns(runs, params) {
+  const combinedReport = [
+    "# kmerators-wasm report",
+    "",
+    `- k-mer lengths: ${runs.map((run) => run.kmer_length).join(", ")}`,
+    "",
+    ...runs.flatMap((run) => [
+      `## k=${run.kmer_length}`,
+      "",
+      run.files.report_md.replace(/^# kmerators-wasm report\n\n/, "").trim(),
+      "",
+    ]),
+  ].join("\n");
+
+  return {
+    kmer_lengths: runs.map((run) => run.kmer_length),
+    kmer_length: runs[0]?.kmer_length || 0,
+    query_sequences: runs[0]?.query_sequences || 0,
+    query_kmers: sum(runs, "query_kmers"),
+    retained_kmers: sum(runs, "retained_kmers"),
+    masked_kmers: sum(runs, "masked_kmers"),
+    transcriptome_enabled: runs.some((run) => run.transcriptome_enabled),
+    genome_enabled: runs.some((run) => run.genome_enabled),
+    transcriptome_hits: maybeSum(runs, "transcriptome_hits"),
+    genome_hits: maybeSum(runs, "genome_hits"),
+    runs,
+    files: { report_md: combinedReport },
+  };
+}
+
+function sum(runs, key) {
+  return runs.reduce((total, run) => total + (run[key] || 0), 0);
+}
+
+function maybeSum(runs, key) {
+  return runs.some((run) => run[key] != null) ? sum(runs, key) : null;
+}
+
+function transferBuffers(result) {
+  return result.runs.map((run) => run.contigs_zst?.buffer).filter(Boolean);
 }
 
 async function ensureZstdReady() {
@@ -115,7 +196,7 @@ async function readWholeFile(source, chunkBytes, phase) {
   return out;
 }
 
-async function scanSources(sources, chunkBytes, phase, scanChunk) {
+async function scanSources(sources, chunkBytes, phase, scanChunk, finishSource) {
   let baseLoaded = 0;
   const knownTotal = sources.every((source) => source.size)
     ? sources.reduce((sum, source) => sum + source.size, 0)
@@ -131,6 +212,7 @@ async function scanSources(sources, chunkBytes, phase, scanChunk) {
       const aggregateTotal = knownTotal || (sourceTotal ? baseLoaded + sourceTotal : 0);
       postProgress(phase, baseLoaded + sourceLoaded, aggregateTotal);
     }
+    finishSource();
     baseLoaded += sourceTotal || sourceLoaded;
   }
 }
@@ -242,10 +324,15 @@ function callBytes(fn, session, bytes) {
     check(fn(session, 0, 0));
     return;
   }
+  if (bytes.byteLength > 0xffffffff) {
+    throw new Error("single wasm transfer is larger than the wasm32 address space");
+  }
   const ptr = exports.kmerators_alloc(bytes.byteLength);
-  if (!ptr) throw new Error("wasm allocation failed");
+  const offset = wasmPtr(ptr);
+  if (!offset) throw new Error("wasm allocation failed");
+  assertWasmRange(offset, bytes.byteLength);
   try {
-    new Uint8Array(exports.memory.buffer, ptr, bytes.byteLength).set(bytes);
+    new Uint8Array(exports.memory.buffer, offset, bytes.byteLength).set(bytes);
     check(fn(session, ptr, bytes.byteLength));
   } finally {
     exports.kmerators_dealloc(ptr, bytes.byteLength);
@@ -261,19 +348,39 @@ function check(code) {
 function readResult(session) {
   const { exports } = wasm.instance;
   const ptr = exports.kmerators_result_ptr(session);
-  const len = exports.kmerators_result_len(session);
-  if (!ptr || !len) return "";
-  const bytes = new Uint8Array(exports.memory.buffer, ptr, len).slice();
+  const offset = wasmPtr(ptr);
+  const len = wasmU32(exports.kmerators_result_len(session));
+  if (!offset || !len) return "";
+  assertWasmRange(offset, len);
+  const bytes = new Uint8Array(exports.memory.buffer, offset, len).slice();
   return decoder.decode(bytes);
 }
 
 function readLastError() {
   const { exports } = wasm.instance;
   const ptr = exports.kmerators_last_error_ptr();
-  const len = exports.kmerators_last_error_len();
-  if (!ptr || !len) return "unknown wasm error";
-  const bytes = new Uint8Array(exports.memory.buffer, ptr, len).slice();
+  const offset = wasmPtr(ptr);
+  const len = wasmU32(exports.kmerators_last_error_len());
+  if (!offset || !len) return "unknown wasm error";
+  assertWasmRange(offset, len);
+  const bytes = new Uint8Array(exports.memory.buffer, offset, len).slice();
   return decoder.decode(bytes);
+}
+
+function wasmPtr(ptr) {
+  return ptr >>> 0;
+}
+
+function wasmU32(value) {
+  return value >>> 0;
+}
+
+function assertWasmRange(offset, len) {
+  const end = offset + len;
+  const size = wasm.instance.exports.memory.buffer.byteLength;
+  if (!Number.isSafeInteger(end) || offset > size || end > size) {
+    throw new Error(`wasm memory range ${offset}..${end} is outside ${size} bytes`);
+  }
 }
 
 function postStatus(title, detail) {

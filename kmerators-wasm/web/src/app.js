@@ -39,6 +39,7 @@ const statusDetail = document.querySelector("#status-detail");
 const elapsedTime = document.querySelector("#elapsed-time");
 const metrics = document.querySelector("#metrics");
 const downloads = document.querySelector("#downloads");
+const downloadButtons = document.querySelector(".download-buttons");
 const reportPreview = document.querySelector("#report-preview");
 
 const progressCards = new Map(
@@ -70,6 +71,16 @@ form.addEventListener("submit", (event) => {
   event.preventDefault();
   const data = new FormData(form);
   const query = selectedFile(data.get("query"));
+  const kmers = parseKmerLengths(data.get("k"));
+  if (!kmers.length) {
+    setStatus("Invalid k-mer sizes", "Enter one or more positive integers.", true);
+    return;
+  }
+  const minimizerLength = parseOptionalPositiveInt(data.get("minimizerLength"));
+  if (minimizerLength != null && kmers.some((k) => minimizerLength > k)) {
+    setStatus("Invalid minimizer", "Minimizer length must be no larger than every k-mer size.", true);
+    return;
+  }
   const payload = {
     sources: {
       query: sourceFromFile(query),
@@ -77,7 +88,9 @@ form.addEventListener("submit", (event) => {
       genome: referenceSources("genome", data),
     },
     params: {
-      k: Number(data.get("k")),
+      k: kmers[0],
+      kmers,
+      minimizerLength: minimizerLength || 0,
       maxTranscriptome: Number(data.get("maxTranscriptome")),
       maxGenome: Number(data.get("maxGenome")),
       chunkBytes: Number(data.get("chunkMb")) * 1024 * 1024,
@@ -85,7 +98,7 @@ form.addEventListener("submit", (event) => {
   };
 
   if (!payload.sources.query) {
-    setStatus("Missing file", "Select a query FASTA file.", true);
+    setStatus("Missing file", "Select a query FASTA/FASTQ file.", true);
     return;
   }
 
@@ -117,7 +130,7 @@ downloads.addEventListener("click", async (event) => {
   if (!button || !result) return;
   button.disabled = true;
   try {
-    await downloadOutput(button.dataset.download);
+    await downloadOutput(button.dataset.download, Number(button.dataset.run || 0));
   } catch (error) {
     setStatus("Download error", error?.message || String(error), true);
   } finally {
@@ -184,6 +197,7 @@ function renderResult(data) {
   metricEls.masked.textContent = formatCount(data.masked_kmers);
   metricEls.genomeHits.textContent = formatMaybeCount(data.genome_hits);
   metrics.hidden = false;
+  renderDownloadButtons(data);
   downloads.hidden = false;
   reportPreview.textContent = data.files.report_md;
   reportPreview.hidden = false;
@@ -226,30 +240,69 @@ function stopTimer() {
   }
 }
 
-async function downloadOutput(key) {
+function renderDownloadButtons(data) {
+  const runs = data.runs?.length ? data.runs : [data];
+  const buttons = [{ key: "kmers_fa", label: "kmers.fa" }, { key: "contigs_fa", label: "contigs.fa" }, { key: "masked_fa", label: "masked.fa" }];
+  downloadButtons.textContent = "";
+
+  if (runs.length === 1) {
+    for (const button of buttons) {
+      downloadButtons.appendChild(downloadButton(button.key, button.label, 0));
+    }
+  } else {
+    for (const [idx, run] of runs.entries()) {
+      const group = document.createElement("div");
+      group.className = "download-group";
+      const label = document.createElement("span");
+      label.textContent = `k=${run.kmer_length}`;
+      group.appendChild(label);
+      for (const button of buttons) {
+        group.appendChild(downloadButton(button.key, button.label, idx));
+      }
+      downloadButtons.appendChild(group);
+    }
+  }
+
+  downloadButtons.appendChild(downloadButton("report_md", "report.md", 0));
+}
+
+function downloadButton(key, label, runIndex) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.dataset.download = key;
+  button.dataset.run = String(runIndex);
+  button.textContent = label;
+  return button;
+}
+
+async function downloadOutput(key, runIndex = 0) {
   const fileNames = {
     kmers_fa: "kmers.fa",
     contigs_fa: "contigs.fa",
     masked_fa: "masked.fa",
     report_md: "report.md",
   };
-  const name = fileNames[key];
+  const runs = result.runs?.length ? result.runs : [result];
+  const run = runs[runIndex] || runs[0];
+  const name = key === "report_md" ? fileNames[key] : outputFileName(run, fileNames[key], runs.length);
   const format = selectedOutputFormat();
   setStatus("Preparing download", name);
 
-  if (key === "contigs_fa") {
-    await downloadContigs(name, format);
+  if (key === "report_md") {
+    await downloadGeneratedBytes(name, singleChunk(strToU8(result.files.report_md || "")), format, "text/plain;charset=utf-8");
+  } else if (key === "contigs_fa") {
+    await downloadContigs(run, name, format);
   } else if (key === "kmers_fa") {
     await downloadGeneratedBytes(
       name,
-      kmersFromContigTextChunks(textChunksFromBytes(contigByteChunks()), result.kmer_length),
+      kmersFromContigTextChunks(textChunksFromBytes(contigByteChunks(run)), run.kmer_length),
       format,
       "text/plain;charset=utf-8",
     );
   } else {
     await downloadGeneratedBytes(
       name,
-      singleChunk(strToU8(result.files[key] || "")),
+      singleChunk(strToU8(run.files[key] || "")),
       format,
       "text/plain;charset=utf-8",
     );
@@ -258,13 +311,13 @@ async function downloadOutput(key) {
   setStatus("Done", "Outputs are ready.");
 }
 
-async function downloadContigs(name, format) {
+async function downloadContigs(run, name, format) {
   if (format === "zst") {
-    downloadBytes(`${name}.zst`, result.contigs_zst, "application/zstd");
+    downloadBytes(`${name}.zst`, run.contigs_zst, "application/zstd");
     return;
   }
 
-  await downloadGeneratedBytes(name, contigByteChunks(), format, "text/plain;charset=utf-8");
+  await downloadGeneratedBytes(name, contigByteChunks(run), format, "text/plain;charset=utf-8");
 }
 
 async function downloadGeneratedBytes(name, byteChunks, format, type) {
@@ -283,8 +336,8 @@ async function downloadGeneratedBytes(name, byteChunks, format, type) {
   await downloadBlobFromChunks(name, byteChunks, type);
 }
 
-async function* contigByteChunks() {
-  const compressed = result?.contigs_zst;
+async function* contigByteChunks(run) {
+  const compressed = run?.contigs_zst;
   if (!compressed) return;
 
   let pending = [];
@@ -374,6 +427,10 @@ function selectedOutputFormat() {
   return document.querySelector('input[name="outputFormat"]:checked')?.value || "plain";
 }
 
+function outputFileName(run, name, runCount) {
+  return runCount > 1 ? `k${run.kmer_length}.${name}` : name;
+}
+
 function downloadBytes(name, bytes, type) {
   downloadBlob(name, new Blob([bytes], { type }));
 }
@@ -389,6 +446,25 @@ function downloadBlob(name, blob) {
 
 function selectedFile(value) {
   return value instanceof File && value.name ? value : null;
+}
+
+function parseKmerLengths(value) {
+  const seen = new Set();
+  const kmers = [];
+  for (const part of String(value || "").split(/[,\s]+/)) {
+    if (!part) continue;
+    const k = Number(part);
+    if (!Number.isInteger(k) || k <= 0 || seen.has(k)) return [];
+    seen.add(k);
+    kmers.push(k);
+  }
+  return kmers;
+}
+
+function parseOptionalPositiveInt(value) {
+  if (value == null || String(value).trim() === "") return null;
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : null;
 }
 
 function sourceFromFile(file) {

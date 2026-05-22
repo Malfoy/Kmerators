@@ -345,6 +345,19 @@ button.secondary {
   min-width: 116px;
 }
 
+.download-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.download-group span {
+  min-width: 48px;
+  font-weight: 700;
+  color: var(--muted);
+}
+
 .report-preview {
   min-height: 260px;
   max-height: 42vh;

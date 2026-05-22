@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 
 use rustc_hash::FxHashMap as HashMap;
 
 const MAX_EXACT_K: usize = 31;
+const MAX_MINIMIZER_K: usize = 31;
 const PREFIX_FILTER_MAX_BITS: usize = 20;
+const HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 thread_local! {
     static SESSIONS: RefCell<Vec<Option<KmeratorRun>>> = const { RefCell::new(Vec::new()) };
@@ -14,6 +18,7 @@ thread_local! {
 #[derive(Debug, Clone, Copy)]
 pub struct RunParams {
     pub k: usize,
+    pub minimizer_length: usize,
     pub max_transcriptome_count: u32,
     pub max_genome_count: u32,
 }
@@ -29,8 +34,8 @@ pub struct KmeratorRun {
     genome_counts: Vec<u32>,
     transcriptome_enabled: bool,
     genome_enabled: bool,
-    transcriptome_scanner: FastaStreamScanner,
-    genome_scanner: FastaStreamScanner,
+    transcriptome_scanner: FastxStreamScanner,
+    genome_scanner: FastxStreamScanner,
     last_json: Vec<u8>,
 }
 
@@ -46,11 +51,13 @@ struct Occurrence {
     pos: usize,
     forward_key: u64,
     canonical_key: u64,
+    minimizer: u64,
+    revcomp_minimizer: u64,
 }
 
 #[derive(Debug, Clone)]
 struct QueryIndex {
-    map: HashMap<u64, Vec<usize>>,
+    map: HashMap<u64, HashMap<u64, Vec<usize>>>,
     filter: PrefixFilter,
 }
 
@@ -62,31 +69,68 @@ struct PrefixFilter {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum KeyMode {
+    Exact,
+    Hashed,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum CountKey {
     Forward,
     Canonical,
 }
 
 #[derive(Debug)]
-struct FastaStreamScanner {
-    in_header: bool,
-    line_start: bool,
-    roller: RollingKmer,
+struct FastxStreamScanner {
+    mode: StreamMode,
+    line: Vec<u8>,
+    fastq_state: FastqState,
+    fastq_seq_len: usize,
+    fastq_quality_len: usize,
+    roller: KmerRoller,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamMode {
+    Unknown,
+    Fasta,
+    Fastq,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastqState {
+    Header,
+    Sequence,
+    Quality,
 }
 
 #[derive(Debug)]
-struct RollingKmer {
+struct KmerRoller {
     k: usize,
+    m: usize,
+    mode: KeyMode,
     valid_len: usize,
     forward: u64,
     reverse: u64,
-    mask: u64,
+    exact_mask: u64,
     rc_shift: usize,
+    minimizer_forward: u64,
+    minimizer_mask: u64,
+    minimizers: VecDeque<(usize, u64)>,
+    window: VecDeque<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KmerHit {
+    forward_key: u64,
+    canonical_key: u64,
+    minimizer: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct RunOutput {
     kmer_length: usize,
+    minimizer_length: usize,
     query_sequences: usize,
     query_kmers: usize,
     retained_kmers: usize,
@@ -110,12 +154,26 @@ impl RunParams {
         if self.k == 0 {
             return Err("k-mer length must be greater than zero".to_string());
         }
-        if self.k > MAX_EXACT_K {
+        let minimizer_length = if self.minimizer_length == 0 {
+            9.min(self.k)
+        } else {
+            self.minimizer_length
+        };
+        if minimizer_length == 0 || minimizer_length > self.k {
             return Err(format!(
-                "this browser prototype supports exact k-mers up to {MAX_EXACT_K}"
+                "minimizer length must be in 1..={} for k={}",
+                self.k, self.k
             ));
         }
-        Ok(self)
+        if minimizer_length > MAX_MINIMIZER_K {
+            return Err(format!(
+                "minimizer length must be <= {MAX_MINIMIZER_K} in the browser build"
+            ));
+        }
+        Ok(Self {
+            minimizer_length,
+            ..self
+        })
     }
 }
 
@@ -132,34 +190,45 @@ impl KmeratorRun {
             genome_counts: Vec::new(),
             transcriptome_enabled: false,
             genome_enabled: false,
-            transcriptome_scanner: FastaStreamScanner::new(params.k),
-            genome_scanner: FastaStreamScanner::new(params.k),
+            transcriptome_scanner: FastxStreamScanner::new(params.k, params.minimizer_length),
+            genome_scanner: FastxStreamScanner::new(params.k, params.minimizer_length),
             last_json: Vec::new(),
         })
     }
 
     pub fn set_query_fasta(&mut self, bytes: &[u8]) -> Result<(), String> {
-        self.query_items = parse_query_fasta(bytes)?;
+        self.query_items = parse_query_fastx(bytes)?;
         if self.query_items.is_empty() {
-            return Err("query FASTA contains no usable sequence".to_string());
+            return Err("query FASTA/FASTQ contains no usable sequence".to_string());
         }
 
-        self.occurrences = build_occurrences(self.params.k, &self.query_items);
+        self.occurrences = build_occurrences(
+            self.params.k,
+            self.params.minimizer_length,
+            &self.query_items,
+        );
         if self.occurrences.is_empty() {
-            return Err("query FASTA produced no valid k-mers".to_string());
+            return Err("query FASTA/FASTQ produced no valid k-mers".to_string());
         }
 
         self.transcriptome_index = QueryIndex::with_capacity(self.params.k, self.occurrences.len());
         self.genome_index = QueryIndex::with_capacity(self.params.k, self.occurrences.len());
         for (idx, occ) in self.occurrences.iter().enumerate() {
-            self.transcriptome_index.insert(occ.forward_key, idx);
-            self.genome_index.insert(occ.canonical_key, idx);
+            self.transcriptome_index
+                .insert(occ.minimizer, occ.forward_key, idx);
+            self.genome_index
+                .insert(occ.minimizer, occ.canonical_key, idx);
+            if occ.revcomp_minimizer != occ.minimizer {
+                self.genome_index
+                    .insert(occ.revcomp_minimizer, occ.canonical_key, idx);
+            }
         }
 
         self.transcriptome_counts = vec![0; self.occurrences.len()];
         self.genome_counts = vec![0; self.occurrences.len()];
-        self.transcriptome_scanner = FastaStreamScanner::new(self.params.k);
-        self.genome_scanner = FastaStreamScanner::new(self.params.k);
+        self.transcriptome_scanner =
+            FastxStreamScanner::new(self.params.k, self.params.minimizer_length);
+        self.genome_scanner = FastxStreamScanner::new(self.params.k, self.params.minimizer_length);
         self.last_json.clear();
         Ok(())
     }
@@ -185,6 +254,14 @@ impl KmeratorRun {
         Ok(())
     }
 
+    pub fn finish_transcriptome_source(&mut self) {
+        self.transcriptome_scanner.finish_source(
+            CountKey::Forward,
+            &self.transcriptome_index,
+            &mut self.transcriptome_counts,
+        );
+    }
+
     pub fn scan_genome_chunk(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.ensure_query_ready()?;
         self.genome_enabled = true;
@@ -196,6 +273,14 @@ impl KmeratorRun {
             &mut self.genome_scanner,
         );
         Ok(())
+    }
+
+    pub fn finish_genome_source(&mut self) {
+        self.genome_scanner.finish_source(
+            CountKey::Canonical,
+            &self.genome_index,
+            &mut self.genome_counts,
+        );
     }
 
     pub fn finish(&mut self) -> Result<&[u8], String> {
@@ -212,7 +297,7 @@ impl KmeratorRun {
 
     fn ensure_query_ready(&self) -> Result<(), String> {
         if self.occurrences.is_empty() {
-            Err("load a query FASTA before scanning references".to_string())
+            Err("load a query FASTA/FASTQ before scanning references".to_string())
         } else {
             Ok(())
         }
@@ -229,6 +314,7 @@ impl KmeratorRun {
         };
         RunOutput {
             kmer_length: self.params.k,
+            minimizer_length: self.params.minimizer_length,
             query_sequences: self.query_items.len(),
             query_kmers: self.occurrences.len(),
             retained_kmers,
@@ -355,6 +441,7 @@ impl KmeratorRun {
         format!(
             "# kmerators-wasm report\n\n\
              - k-mer length: {}\n\
+             - minimizer length: {}\n\
              - query sequences: {}\n\
              - query k-mers: {}\n\
              - retained k-mers: {}\n\
@@ -362,6 +449,7 @@ impl KmeratorRun {
              - transcriptome filter: {}\n\
              - genome filter: {}\n",
             self.params.k,
+            self.params.minimizer_length,
             self.query_items.len(),
             self.occurrences.len(),
             retained_kmers,
@@ -390,16 +478,24 @@ impl QueryIndex {
         }
     }
 
-    fn insert(&mut self, key: u64, id: usize) {
+    fn insert(&mut self, minimizer: u64, key: u64, id: usize) {
         self.filter.insert(key);
-        self.map.entry(key).or_default().push(id);
+        self.map
+            .entry(minimizer)
+            .or_default()
+            .entry(key)
+            .or_default()
+            .push(id);
     }
 
-    fn count_key(&self, key: u64, counts: &mut [u32]) {
+    fn count_key(&self, minimizer: u64, key: u64, counts: &mut [u32]) {
         if !self.filter.maybe_contains(key) {
             return;
         }
-        if let Some(ids) = self.map.get(&key) {
+        let Some(partition) = self.map.get(&minimizer) else {
+            return;
+        };
+        if let Some(ids) = partition.get(&key) {
             for &id in ids {
                 counts[id] = counts[id].saturating_add(1);
             }
@@ -409,7 +505,7 @@ impl QueryIndex {
 
 impl PrefixFilter {
     fn new(k: usize) -> Self {
-        let bits = (2 * k).min(PREFIX_FILTER_MAX_BITS);
+        let bits = key_bits(k).min(PREFIX_FILTER_MAX_BITS);
         let word_count = (1usize << bits).div_ceil(64);
         Self {
             k,
@@ -429,7 +525,7 @@ impl PrefixFilter {
     }
 
     fn prefix(&self, key: u64) -> usize {
-        let key_bits = 2 * self.k;
+        let key_bits = key_bits(self.k);
         let value = if key_bits > self.bits {
             key >> (key_bits - self.bits)
         } else {
@@ -439,75 +535,240 @@ impl PrefixFilter {
     }
 }
 
-impl FastaStreamScanner {
-    fn new(k: usize) -> Self {
+impl FastxStreamScanner {
+    fn new(k: usize, minimizer_length: usize) -> Self {
         Self {
-            in_header: false,
-            line_start: true,
-            roller: RollingKmer::new(k),
+            mode: StreamMode::Unknown,
+            line: Vec::new(),
+            fastq_state: FastqState::Header,
+            fastq_seq_len: 0,
+            fastq_quality_len: 0,
+            roller: KmerRoller::new(k, minimizer_length),
         }
     }
 
     fn scan(&mut self, bytes: &[u8], key_kind: CountKey, index: &QueryIndex, counts: &mut [u32]) {
         for &byte in bytes {
-            match byte {
-                b'\n' => {
-                    if self.in_header {
-                        self.in_header = false;
-                    }
-                    self.line_start = true;
-                }
-                b'\r' | b' ' | b'\t' => {}
-                b'>' if self.line_start => {
-                    self.in_header = true;
-                    self.line_start = false;
+            if byte == b'\n' {
+                self.process_pending_line(key_kind, index, counts);
+            } else {
+                self.line.push(byte);
+            }
+        }
+    }
+
+    fn finish_source(&mut self, key_kind: CountKey, index: &QueryIndex, counts: &mut [u32]) {
+        if !self.line.is_empty() {
+            let line = strip_cr(&self.line).to_vec();
+            self.line.clear();
+            self.process_line(&line, key_kind, index, counts);
+        }
+        self.mode = StreamMode::Unknown;
+        self.fastq_state = FastqState::Header;
+        self.fastq_seq_len = 0;
+        self.fastq_quality_len = 0;
+        self.roller.reset();
+    }
+
+    fn process_pending_line(&mut self, key_kind: CountKey, index: &QueryIndex, counts: &mut [u32]) {
+        let line = strip_cr(&self.line).to_vec();
+        self.line.clear();
+        self.process_line(&line, key_kind, index, counts);
+    }
+
+    fn process_line(
+        &mut self,
+        line: &[u8],
+        key_kind: CountKey,
+        index: &QueryIndex,
+        counts: &mut [u32],
+    ) {
+        let trimmed = trim_ascii(line);
+        if trimmed.is_empty() {
+            return;
+        }
+
+        if self.mode == StreamMode::Unknown {
+            self.mode = if trimmed.starts_with(b">") {
+                StreamMode::Fasta
+            } else if trimmed.starts_with(b"@") {
+                StreamMode::Fastq
+            } else {
+                StreamMode::Fasta
+            };
+        }
+
+        match self.mode {
+            StreamMode::Unknown => {}
+            StreamMode::Fasta => self.process_fasta_line(trimmed, key_kind, index, counts),
+            StreamMode::Fastq => self.process_fastq_line(line, trimmed, key_kind, index, counts),
+        }
+    }
+
+    fn process_fasta_line(
+        &mut self,
+        line: &[u8],
+        key_kind: CountKey,
+        index: &QueryIndex,
+        counts: &mut [u32],
+    ) {
+        if line.starts_with(b">") {
+            self.roller.reset();
+            return;
+        }
+        self.scan_sequence(line, key_kind, index, counts);
+    }
+
+    fn process_fastq_line(
+        &mut self,
+        line: &[u8],
+        trimmed: &[u8],
+        key_kind: CountKey,
+        index: &QueryIndex,
+        counts: &mut [u32],
+    ) {
+        match self.fastq_state {
+            FastqState::Header => {
+                if trimmed.starts_with(b"@") {
                     self.roller.reset();
+                    self.fastq_seq_len = 0;
+                    self.fastq_quality_len = 0;
+                    self.fastq_state = FastqState::Sequence;
                 }
-                _ if self.in_header => {
-                    self.line_start = false;
+            }
+            FastqState::Sequence => {
+                if trimmed.starts_with(b"+") {
+                    self.fastq_state = FastqState::Quality;
+                    self.fastq_quality_len = 0;
+                    return;
                 }
-                _ => {
-                    self.line_start = false;
-                    if let Some(bits) = base_bits(byte) {
-                        if let Some((forward, canonical)) = self.roller.push(bits) {
-                            let key = match key_kind {
-                                CountKey::Forward => forward,
-                                CountKey::Canonical => canonical,
-                            };
-                            index.count_key(key, counts);
-                        }
-                    } else {
-                        self.roller.reset();
-                    }
+                self.fastq_seq_len += count_non_whitespace(trimmed);
+                self.scan_sequence(trimmed, key_kind, index, counts);
+            }
+            FastqState::Quality => {
+                self.fastq_quality_len += strip_cr(line).len();
+                if self.fastq_quality_len >= self.fastq_seq_len {
+                    self.fastq_state = FastqState::Header;
                 }
+            }
+        }
+    }
+
+    fn scan_sequence(
+        &mut self,
+        line: &[u8],
+        key_kind: CountKey,
+        index: &QueryIndex,
+        counts: &mut [u32],
+    ) {
+        for &byte in line {
+            if byte.is_ascii_whitespace() {
+                continue;
+            }
+            if let Some(hit) = self.roller.push(byte) {
+                let key = match key_kind {
+                    CountKey::Forward => hit.forward_key,
+                    CountKey::Canonical => hit.canonical_key,
+                };
+                index.count_key(hit.minimizer, key, counts);
             }
         }
     }
 }
 
-impl RollingKmer {
-    fn new(k: usize) -> Self {
+impl KmerRoller {
+    fn new(k: usize, minimizer_length: usize) -> Self {
+        let mode = if k <= MAX_EXACT_K {
+            KeyMode::Exact
+        } else {
+            KeyMode::Hashed
+        };
         Self {
             k,
+            m: minimizer_length,
+            mode,
             valid_len: 0,
             forward: 0,
             reverse: 0,
-            mask: (1u64 << (2 * k)) - 1,
-            rc_shift: 2 * (k - 1),
+            exact_mask: exact_mask(k),
+            rc_shift: 2 * (k.saturating_sub(1)),
+            minimizer_forward: 0,
+            minimizer_mask: exact_mask(minimizer_length),
+            minimizers: VecDeque::new(),
+            window: VecDeque::with_capacity(k),
         }
     }
 
-    fn push(&mut self, bits: u64) -> Option<(u64, u64)> {
-        self.forward = ((self.forward << 2) | bits) & self.mask;
-        self.reverse = (self.reverse >> 2) | ((bits ^ 0b10) << self.rc_shift);
-        self.valid_len = (self.valid_len + 1).min(self.k);
-        (self.valid_len == self.k).then_some((self.forward, self.forward.min(self.reverse)))
+    fn push(&mut self, byte: u8) -> Option<KmerHit> {
+        let bits = match base_bits(byte) {
+            Some(bits) => bits,
+            None => {
+                self.reset();
+                return None;
+            }
+        };
+        let base = normalize_base(byte);
+        self.valid_len += 1;
+
+        if matches!(self.mode, KeyMode::Exact) {
+            self.forward = ((self.forward << 2) | bits) & self.exact_mask;
+            self.reverse = (self.reverse >> 2) | ((bits ^ 0b10) << self.rc_shift);
+        } else {
+            self.window.push_back(base);
+            if self.window.len() > self.k {
+                self.window.pop_front();
+            }
+        }
+
+        self.minimizer_forward = ((self.minimizer_forward << 2) | bits) & self.minimizer_mask;
+        if self.valid_len >= self.m {
+            let mmer_start = self.valid_len - self.m;
+            while self
+                .minimizers
+                .back()
+                .is_some_and(|&(_, value)| value > self.minimizer_forward)
+            {
+                self.minimizers.pop_back();
+            }
+            self.minimizers
+                .push_back((mmer_start, self.minimizer_forward));
+        }
+
+        if self.valid_len < self.k {
+            return None;
+        }
+
+        let kmer_start = self.valid_len - self.k;
+        while self
+            .minimizers
+            .front()
+            .is_some_and(|&(pos, _)| pos < kmer_start)
+        {
+            self.minimizers.pop_front();
+        }
+        let minimizer = self.minimizers.front().map(|&(_, value)| value)?;
+        let (forward_key, canonical_key) = match self.mode {
+            KeyMode::Exact => (self.forward, self.forward.min(self.reverse)),
+            KeyMode::Hashed => {
+                let forward = hash_bases(self.window.iter().copied());
+                let reverse = hash_revcomp_bases(self.window.iter().copied().rev());
+                (forward, forward.min(reverse))
+            }
+        };
+        Some(KmerHit {
+            forward_key,
+            canonical_key,
+            minimizer,
+        })
     }
 
     fn reset(&mut self) {
         self.valid_len = 0;
         self.forward = 0;
         self.reverse = 0;
+        self.minimizer_forward = 0;
+        self.minimizers.clear();
+        self.window.clear();
     }
 }
 
@@ -516,9 +777,22 @@ fn scan_chunk(
     key_kind: CountKey,
     index: &QueryIndex,
     counts: &mut [u32],
-    scanner: &mut FastaStreamScanner,
+    scanner: &mut FastxStreamScanner,
 ) {
     scanner.scan(bytes, key_kind, index, counts);
+}
+
+fn parse_query_fastx(bytes: &[u8]) -> Result<Vec<QueryItem>, String> {
+    match bytes
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+    {
+        Some(b'>') => parse_query_fasta(bytes),
+        Some(b'@') => parse_query_fastq(bytes),
+        Some(_) => parse_query_fasta(bytes),
+        None => Ok(Vec::new()),
+    }
 }
 
 fn parse_query_fasta(bytes: &[u8]) -> Result<Vec<QueryItem>, String> {
@@ -557,6 +831,61 @@ fn parse_query_fasta(bytes: &[u8]) -> Result<Vec<QueryItem>, String> {
     Ok(items)
 }
 
+fn parse_query_fastq(bytes: &[u8]) -> Result<Vec<QueryItem>, String> {
+    let mut items = Vec::new();
+    let mut lines = bytes.split(|&byte| byte == b'\n').peekable();
+
+    loop {
+        let Some(header) = next_nonempty_line(&mut lines) else {
+            break;
+        };
+        let header = trim_ascii(strip_cr(header));
+        let Some(header) = header.strip_prefix(b"@") else {
+            return Err("FASTQ record does not start with @".to_string());
+        };
+        let id = first_token(header).unwrap_or_else(|| {
+            let next_id = items.len() + 1;
+            format!("query_{next_id}")
+        });
+
+        let mut seq = Vec::new();
+        let mut saw_plus = false;
+        for raw_line in lines.by_ref() {
+            let line = trim_ascii(strip_cr(raw_line));
+            if line.starts_with(b"+") {
+                saw_plus = true;
+                break;
+            }
+            for &byte in line {
+                if !byte.is_ascii_whitespace() {
+                    seq.push(normalize_base(byte));
+                }
+            }
+        }
+        if !saw_plus {
+            return Err(format!("FASTQ record {id} is missing a + separator"));
+        }
+        if seq.is_empty() {
+            return Err(format!("query sequence {id} has no bases"));
+        }
+
+        let mut quality_len = 0usize;
+        for raw_line in lines.by_ref() {
+            quality_len += strip_cr(raw_line).len();
+            if quality_len >= seq.len() {
+                break;
+            }
+        }
+        if quality_len < seq.len() {
+            return Err(format!("FASTQ record {id} has too few quality characters"));
+        }
+
+        items.push(QueryItem { id, seq });
+    }
+
+    Ok(items)
+}
+
 fn flush_query_item(
     items: &mut Vec<QueryItem>,
     current_id: &mut Option<String>,
@@ -576,21 +905,21 @@ fn flush_query_item(
     Ok(())
 }
 
-fn build_occurrences(k: usize, items: &[QueryItem]) -> Vec<Occurrence> {
+fn build_occurrences(k: usize, minimizer_length: usize, items: &[QueryItem]) -> Vec<Occurrence> {
     let mut occurrences = Vec::new();
     for (item_idx, item) in items.iter().enumerate() {
-        let mut roller = RollingKmer::new(k);
+        let mut roller = KmerRoller::new(k, minimizer_length);
         for (idx, &byte) in item.seq.iter().enumerate() {
-            let Some(bits) = base_bits(byte) else {
-                roller.reset();
-                continue;
-            };
-            if let Some((forward, canonical)) = roller.push(bits) {
+            if let Some(hit) = roller.push(byte) {
+                let pos = idx + 1 - k;
                 occurrences.push(Occurrence {
                     item_idx,
-                    pos: idx + 1 - k,
-                    forward_key: forward,
-                    canonical_key: canonical,
+                    pos,
+                    forward_key: hit.forward_key,
+                    canonical_key: hit.canonical_key,
+                    minimizer: hit.minimizer,
+                    revcomp_minimizer: revcomp_minimizer(&item.seq[pos..pos + k], minimizer_length)
+                        .unwrap_or(hit.minimizer),
                 });
             }
         }
@@ -615,6 +944,65 @@ fn normalize_base(base: u8) -> u8 {
     }
 }
 
+fn exact_mask(k: usize) -> u64 {
+    if k >= 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * k)) - 1
+    }
+}
+
+fn key_bits(k: usize) -> usize {
+    if k <= MAX_EXACT_K { 2 * k } else { 64 }
+}
+
+fn hash_bases<I>(bases: I) -> u64
+where
+    I: IntoIterator<Item = u8>,
+{
+    let mut hash = HASH_OFFSET;
+    for base in bases {
+        hash ^= u64::from(base_bits(base).unwrap_or(4));
+        hash = hash.wrapping_mul(HASH_PRIME);
+    }
+    hash
+}
+
+fn hash_revcomp_bases<I>(bases: I) -> u64
+where
+    I: IntoIterator<Item = u8>,
+{
+    let mut hash = HASH_OFFSET;
+    for base in bases {
+        hash ^= u64::from(base_bits(base).map(|bits| bits ^ 0b10).unwrap_or(4));
+        hash = hash.wrapping_mul(HASH_PRIME);
+    }
+    hash
+}
+
+fn revcomp_minimizer(seq: &[u8], m: usize) -> Option<u64> {
+    if seq.len() < m {
+        return None;
+    }
+    let mask = exact_mask(m);
+    let mut value = 0u64;
+    let mut valid_len = 0usize;
+    let mut best = None::<u64>;
+    for &base in seq.iter().rev() {
+        let bits = base_bits(base)? ^ 0b10;
+        value = ((value << 2) | bits) & mask;
+        valid_len += 1;
+        if valid_len >= m && best.is_none_or(|current| value < current) {
+            best = Some(value);
+        }
+    }
+    best
+}
+
+fn strip_cr(bytes: &[u8]) -> &[u8] {
+    bytes.strip_suffix(b"\r").unwrap_or(bytes)
+}
+
 fn trim_ascii(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
@@ -626,6 +1014,20 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
         .map(|idx| idx + 1)
         .unwrap_or(start);
     &bytes[start..end]
+}
+
+fn count_non_whitespace(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .count()
+}
+
+fn next_nonempty_line<'a, I>(lines: &mut I) -> Option<&'a [u8]>
+where
+    I: Iterator<Item = &'a [u8]>,
+{
+    lines.find(|line| !trim_ascii(strip_cr(line)).is_empty())
 }
 
 fn first_token(header: &[u8]) -> Option<String> {
@@ -740,9 +1142,20 @@ pub extern "C" fn kmerators_session_new(
     max_transcriptome_count: u32,
     max_genome_count: u32,
 ) -> u32 {
+    kmerators_session_new_with_minimizer(k, 0, max_transcriptome_count, max_genome_count)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kmerators_session_new_with_minimizer(
+    k: u32,
+    minimizer_length: u32,
+    max_transcriptome_count: u32,
+    max_genome_count: u32,
+) -> u32 {
     clear_last_error();
     let run = match KmeratorRun::new(RunParams {
         k: k as usize,
+        minimizer_length: minimizer_length as usize,
         max_transcriptome_count,
         max_genome_count,
     }) {
@@ -800,6 +1213,15 @@ pub unsafe extern "C" fn kmerators_set_query_fasta(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn kmerators_set_query_fastx(
+    session_id: u32,
+    ptr: *const u8,
+    len: usize,
+) -> i32 {
+    unsafe { kmerators_set_query_fasta(session_id, ptr, len) }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn kmerators_set_transcriptome_enabled(session_id: u32, enabled: u32) -> i32 {
     with_session_mut(session_id, |session| {
         session.set_transcriptome_enabled(enabled != 0);
@@ -834,6 +1256,14 @@ pub unsafe extern "C" fn kmerators_scan_transcriptome_chunk(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn kmerators_finish_transcriptome_source(session_id: u32) -> i32 {
+    with_session_mut(session_id, |session| {
+        session.finish_transcriptome_source();
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn kmerators_scan_genome_chunk(
     session_id: u32,
     ptr: *const u8,
@@ -847,6 +1277,14 @@ pub unsafe extern "C" fn kmerators_scan_genome_chunk(
         }
     };
     with_session_mut(session_id, |session| session.scan_genome_chunk(bytes))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kmerators_finish_genome_source(session_id: u32) -> i32 {
+    with_session_mut(session_id, |session| {
+        session.finish_genome_source();
+        Ok(())
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -897,6 +1335,7 @@ mod tests {
     fn run_tiny_with_chunks(chunks: &[&[u8]]) -> RunOutput {
         let mut run = KmeratorRun::new(RunParams {
             k: 5,
+            minimizer_length: 0,
             max_transcriptome_count: 0,
             max_genome_count: 1,
         })
@@ -924,6 +1363,7 @@ mod tests {
     fn invalid_bases_break_kmer_windows() {
         let mut run = KmeratorRun::new(RunParams {
             k: 3,
+            minimizer_length: 0,
             max_transcriptome_count: 99,
             max_genome_count: 99,
         })
@@ -941,6 +1381,7 @@ mod tests {
     fn headers_break_kmer_windows() {
         let mut run = KmeratorRun::new(RunParams {
             k: 4,
+            minimizer_length: 0,
             max_transcriptome_count: 99,
             max_genome_count: 99,
         })
@@ -957,6 +1398,7 @@ mod tests {
     fn reverse_complement_counts_for_genome() {
         let mut run = KmeratorRun::new(RunParams {
             k: 5,
+            minimizer_length: 0,
             max_transcriptome_count: 99,
             max_genome_count: 99,
         })
@@ -973,6 +1415,7 @@ mod tests {
     fn retained_kmers_merge_into_contigs() {
         let mut run = KmeratorRun::new(RunParams {
             k: 3,
+            minimizer_length: 0,
             max_transcriptome_count: 0,
             max_genome_count: 10,
         })
@@ -994,6 +1437,7 @@ mod tests {
     fn skipped_references_do_not_filter_or_fake_counts() {
         let mut run = KmeratorRun::new(RunParams {
             k: 3,
+            minimizer_length: 0,
             max_transcriptome_count: 0,
             max_genome_count: 0,
         })
@@ -1005,7 +1449,59 @@ mod tests {
         assert_eq!(output.retained_kmers, 3);
         assert_eq!(output.transcriptome_hits, None);
         assert_eq!(output.genome_hits, None);
-        assert!(output.files.report_md.contains("transcriptome filter: skipped"));
+        assert!(
+            output
+                .files
+                .report_md
+                .contains("transcriptome filter: skipped")
+        );
         assert!(output.files.report_md.contains("genome filter: skipped"));
+    }
+
+    #[test]
+    fn fastq_query_and_reference_ignore_quality_lines() {
+        let mut run = KmeratorRun::new(RunParams {
+            k: 5,
+            minimizer_length: 0,
+            max_transcriptome_count: 99,
+            max_genome_count: 99,
+        })
+        .unwrap();
+        run.set_query_fasta(b"@q1\nACGTA\n+\n!!!!!\n").unwrap();
+        run.scan_genome_chunk(b"@chr1\nACGTA\n+\nAAAAA\n").unwrap();
+        run.finish_genome_source();
+        run.finish().unwrap();
+        let output: RunOutput = serde_json::from_slice(run.last_json()).unwrap();
+
+        assert_eq!(output.query_kmers, 1);
+        assert_eq!(output.genome_hits, Some(1));
+    }
+
+    #[test]
+    fn long_kmers_use_hashed_keys() {
+        let query = b"ACGTTGCAACGTGGTACCTTAGGCTAACCGTATGCCGTAACCTGG";
+        let mut query_fasta = b">q1\n".to_vec();
+        query_fasta.extend_from_slice(query);
+        query_fasta.push(b'\n');
+
+        let mut genome_fasta = b">chr1\n".to_vec();
+        genome_fasta.extend_from_slice(query);
+
+        let mut run = KmeratorRun::new(RunParams {
+            k: 41,
+            minimizer_length: 9,
+            max_transcriptome_count: 99,
+            max_genome_count: 99,
+        })
+        .unwrap();
+        run.set_query_fasta(&query_fasta).unwrap();
+        run.scan_genome_chunk(&genome_fasta).unwrap();
+        run.finish_genome_source();
+        run.finish().unwrap();
+        let output: RunOutput = serde_json::from_slice(run.last_json()).unwrap();
+
+        assert_eq!(output.query_kmers, query.len() - 41 + 1);
+        assert_eq!(output.genome_hits, Some((query.len() - 41 + 1) as u64));
+        assert!(output.files.report_md.contains("minimizer length: 9"));
     }
 }

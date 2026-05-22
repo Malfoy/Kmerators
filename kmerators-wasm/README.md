@@ -8,17 +8,18 @@ changing the native command-line crate layout.
 
 ## Scope
 
-- Local FASTA query, transcriptome, and genome files.
+- Local FASTA/FASTQ query, transcriptome, and genome files.
 - Transcriptome and genome references are optional filters.
 - Optional default Ensembl human GRCh38 references can be streamed directly:
   genome primary assembly, transcriptome cDNA, and transcriptome ncRNA.
 - Streaming reference scans so the genome is not loaded into memory.
-- Plain, gzip, zstd, and xz input FASTA files.
+- Plain, gzip, zstd, and xz input FASTA/FASTQ files.
 - Plain, gzip, and zstd output downloads.
+- Multiple k-mer sizes in one run.
+- Exact k-mers up to 31 bases and hashed k-mer keys above 31 bases.
+- Configurable minimizer length.
 - Rust core compiled to `wasm32-unknown-unknown`.
 - Browser UI that runs the core inside a Web Worker.
-
-The first implementation supports exact k-mer lengths from 1 to 31.
 
 ## Build
 
@@ -46,7 +47,7 @@ cd web && npm run check && npm run build
 
 ## Memory Notes
 
-Reference FASTA files are decoded and scanned in chunks. They are not kept in
+Reference FASTA/FASTQ files are decoded and scanned in chunks. They are not kept in
 memory after scanning. Query sequences and query k-mer occurrences are kept in
 memory because filtering and retained contig assembly need their original
 coordinates and sequence text.
