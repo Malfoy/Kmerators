@@ -1,0 +1,20 @@
+{
+  "name": "kmerators-wasm-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "check": "node --check src/app.js && node --check src/worker.js && node --test test/*.test.js"
+  },
+  "dependencies": {
+    "@bokuweb/zstd-wasm": "^0.0.27",
+    "fflate": "^0.8.3",
+    "fzstd": "^0.1.1",
+    "xz-decompress": "^0.2.3"
+  },
+  "devDependencies": {
+    "vite": "^7.3.0"
+  }
+}

@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>kmerators-wasm</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./src/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <aside class="controls-panel">
+          <div class="brand">
+            <h1>kmerators-wasm</h1>
+            <p>Local FASTA specificity filtering</p>
+          </div>
+
+          <form id="run-form" class="run-form">
+            <label class="file-field">
+              <span>Query FASTA</span>
+              <input id="query-file" name="query" type="file" accept=".fa,.fasta,.fna,.txt,.gz,.zst,.zstd,.xz" required />
+            </label>
+
+            <label class="file-field">
+              <span>Transcriptome FASTA optional</span>
+              <input id="transcriptome-file" name="transcriptome" type="file" accept=".fa,.fasta,.fna,.txt,.gz,.zst,.zstd,.xz" />
+            </label>
+            <label class="default-source">
+              <input id="default-transcriptome" name="defaultTranscriptome" type="checkbox" />
+              <span>Use Ensembl human GRCh38 transcriptome</span>
+            </label>
+
+            <label class="file-field">
+              <span>Genome FASTA optional</span>
+              <input id="genome-file" name="genome" type="file" accept=".fa,.fasta,.fna,.txt,.gz,.zst,.zstd,.xz" />
+            </label>
+            <label class="default-source">
+              <input id="default-genome" name="defaultGenome" type="checkbox" />
+              <span>Use Ensembl human GRCh38 genome</span>
+            </label>
+
+            <div class="param-grid">
+              <label>
+                <span>k-mer</span>
+                <input id="kmer-length" name="k" type="number" min="1" max="31" value="31" required />
+              </label>
+              <label>
+                <span>Max matches in transcriptome*</span>
+                <input id="max-transcriptome" name="maxTranscriptome" type="number" min="0" value="0" required />
+              </label>
+              <label>
+                <span>Max matches in genome*</span>
+                <input id="max-genome" name="maxGenome" type="number" min="0" value="1" required />
+              </label>
+            </div>
+
+            <p class="field-note">
+              * Maximum allowed number of matches for each query k-mer in the selected reference.
+            </p>
+
+            <details class="advanced-params">
+              <summary>Additional parameters</summary>
+              <label>
+                <span>Chunk size MB</span>
+                <input id="chunk-mb" name="chunkMb" type="number" min="1" max="64" value="4" required />
+              </label>
+            </details>
+
+            <div class="button-row">
+              <button id="run-button" type="submit">Run</button>
+              <button id="reset-button" type="button" class="secondary">Clear</button>
+            </div>
+          </form>
+        </aside>
+
+        <section class="run-panel">
+          <div class="status-bar">
+            <div>
+              <h2 id="status-title">Ready</h2>
+              <p id="status-detail">Select files and run the filter.</p>
+            </div>
+            <output id="elapsed-time">0.0s</output>
+          </div>
+
+          <div class="progress-grid" aria-live="polite">
+            <article class="progress-card" data-progress="query">
+              <div class="progress-head">
+                <span>Query</span>
+                <output>0 B</output>
+              </div>
+              <div class="progress-track"><div></div></div>
+            </article>
+            <article class="progress-card" data-progress="transcriptome">
+              <div class="progress-head">
+                <span>Transcriptome</span>
+                <output>0 B</output>
+              </div>
+              <div class="progress-track"><div></div></div>
+            </article>
+            <article class="progress-card" data-progress="genome">
+              <div class="progress-head">
+                <span>Genome</span>
+                <output>0 B</output>
+              </div>
+              <div class="progress-track"><div></div></div>
+            </article>
+          </div>
+
+          <section class="metrics" id="metrics" hidden>
+            <article>
+              <span>Query k-mers</span>
+              <strong id="metric-query-kmers">0</strong>
+            </article>
+            <article>
+              <span>Retained</span>
+              <strong id="metric-retained">0</strong>
+            </article>
+            <article>
+              <span>Masked</span>
+              <strong id="metric-masked">0</strong>
+            </article>
+            <article>
+              <span>Genome hits</span>
+              <strong id="metric-genome-hits">0</strong>
+            </article>
+          </section>
+
+          <section class="downloads" id="downloads" hidden>
+            <fieldset class="output-format output-format-inline">
+              <legend>Download format</legend>
+              <label>
+                <input type="radio" name="outputFormat" value="plain" checked />
+                <span>Plain</span>
+              </label>
+              <label>
+                <input type="radio" name="outputFormat" value="gz" />
+                <span>gz</span>
+              </label>
+              <label>
+                <input type="radio" name="outputFormat" value="zst" />
+                <span>zstd</span>
+              </label>
+            </fieldset>
+
+            <div class="download-buttons">
+              <button type="button" data-download="kmers_fa">kmers.fa</button>
+              <button type="button" data-download="contigs_fa">contigs.fa</button>
+              <button type="button" data-download="masked_fa">masked.fa</button>
+              <button type="button" data-download="report_md">report.md</button>
+            </div>
+          </section>
+
+          <pre id="report-preview" class="report-preview" hidden></pre>
+        </section>
+      </section>
+    </main>
+
+    <script type="module" src="./src/app.js"></script>
+  </body>
+</html>

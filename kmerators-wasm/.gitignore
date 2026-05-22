@@ -1,0 +1,6 @@
+/target/
+/web/wasm/*.wasm
+/web/node_modules/
+/web/dist/
+*.log
+.DS_Store

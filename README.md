@@ -55,6 +55,164 @@ The tiny example is fully offline. It builds the tool, runs it on checked-in
 FASTA files, enables `--write-kmers`, and verifies `kmers.fa`, `contigs.fa`,
 and `masked.fa` against expected outputs.
 
+## Run The WebAssembly Browser Version
+
+The repository also contains a browser prototype in `kmerators-wasm/`. This is
+separate from the native command-line tool: it compiles a small Rust core to
+WebAssembly, loads it in a Web Worker, and lets the user run the filtering
+locally from a web page.
+
+The important idea is:
+
+- the FASTA query file is selected from the browser;
+- transcriptome and genome references are optional;
+- references are decoded and scanned in chunks, so the browser does not need to
+  keep the full genome FASTA in memory;
+- when the default Ensembl references are selected, the browser downloads and
+  streams them directly from Ensembl;
+- the output files are generated locally in the browser.
+
+No uploaded server is involved in the normal local workflow. The only network
+traffic is the optional download of default references and the local Vite
+development server that serves the app to your own browser.
+
+### 1. Install The Requirements
+
+You need the usual Rust toolchain, plus the WebAssembly target:
+
+```sh
+rustup target add wasm32-unknown-unknown
+```
+
+You also need Node.js with `npm`. Check that the commands exist:
+
+```sh
+rustc --version
+cargo --version
+node --version
+npm --version
+```
+
+If `node` or `npm` is missing, install Node.js from your system package manager
+or from the official Node.js installer.
+
+### 2. Build The WebAssembly Core
+
+From the repository root:
+
+```sh
+cd kmerators-wasm
+./scripts/build-wasm.sh
+```
+
+This command compiles the Rust WebAssembly crate and writes the browser artifact
+to:
+
+```text
+web/wasm/kmerators_wasm_core.wasm
+```
+
+Run this script again whenever the Rust code under `kmerators-wasm/crates/`
+changes.
+
+### 3. Install The Web App Dependencies
+
+Still from `kmerators-wasm/`:
+
+```sh
+cd web
+npm install
+```
+
+This creates `web/node_modules/`. It is a local dependency directory and should
+not be committed.
+
+### 4. Start The Local Browser App
+
+From `kmerators-wasm/web/`:
+
+```sh
+npm run start
+```
+
+Vite prints a local address, usually:
+
+```text
+http://127.0.0.1:5173/
+```
+
+Open that address in your browser. Keep the terminal running while you use the
+app; stopping it stops the local web server.
+
+### 5. Run A Filtering Job
+
+In the browser:
+
+1. Select a query FASTA file. This field is required.
+2. Optionally select a transcriptome FASTA file, or enable the default Ensembl
+   human GRCh38 transcriptome.
+3. Optionally select a genome FASTA file, or enable the default Ensembl human
+   GRCh38 genome.
+4. Choose the k-mer size and the maximum allowed reference matches.
+5. Click `Run`.
+6. Download `contigs.fa`, `masked.fa`, `report.md`, or `kmers.fa` from the
+   output panel.
+
+The transcriptome and genome fields can be left empty. If they are empty, that
+filtering phase is skipped. This is useful for quick tests, for query-only
+experiments, or when you want to apply only one reference filter.
+
+Input FASTA files can be plain text or compressed as `.gz`, `.zst`, `.zstd`, or
+`.xz`. Output downloads can be plain text, `.gz`, or `.zst`.
+
+### 6. Understand The Browser Memory Model
+
+The WebAssembly version is designed to avoid loading full reference genomes into
+RAM. The transcriptome and genome streams are decoded chunk by chunk and scanned
+against the query k-mer index.
+
+The query sequences and query k-mer index are kept in memory because they define
+the k-mers being filtered. After a run, the browser keeps `contigs.fa` as zstd
+level `-1` compressed bytes. `kmers.fa` is not stored; it is generated only when
+you click its download button by streaming over the decompressed contigs.
+
+For zstd downloads of generated files, the current browser prototype still needs
+to collect that selected generated output before compressing it. Plain and gzip
+downloads for `contigs.fa` and `kmers.fa` are generated from streaming contig
+decompression.
+
+### 7. Quick Checks And Troubleshooting
+
+Run the WebAssembly tests from `kmerators-wasm/`:
+
+```sh
+cargo test
+./scripts/build-wasm.sh
+cd web
+npm run check
+npm run build
+```
+
+If `./scripts/build-wasm.sh` fails with a missing target error, run:
+
+```sh
+rustup target add wasm32-unknown-unknown
+```
+
+If the browser says that the `.wasm` file cannot be found, rebuild it:
+
+```sh
+cd kmerators-wasm
+./scripts/build-wasm.sh
+```
+
+If `npm run start` says that port `5173` is already used, Vite will usually
+choose another local port. Open the URL printed in the terminal.
+
+If the default Ensembl references fail to download, check your network access.
+The default human genome is large, so the first run can take time depending on
+network speed and browser performance.
+
 ## What Files Do I Need?
 
 For local FASTA/FASTQ mode, provide:
