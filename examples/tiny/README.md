@@ -27,7 +27,6 @@ cargo run --release --bin kmerators -- \
   --transcriptome-fasta examples/tiny/transcriptome.fa \
   -g examples/tiny/genome.fa \
   -S toy_species \
-  -r 1 \
   -k 5 \
   -m 3 \
   --hash-tables 64 \
@@ -36,8 +35,8 @@ cargo run --release --bin kmerators -- \
   -y
 ```
 
-The `-r 1` value is intentional: it keeps this local example fully offline by
-avoiding the default `last` Ensembl release lookup.
+Supplying both local FASTA inputs keeps this example fully offline; the run is
+reported with release `local`.
 
 Expected retained k-mers:
 
@@ -59,7 +58,6 @@ cargo run --release --bin kmerators -- \
   --transcriptome-fasta examples/tiny/transcriptome.fa \
   -g examples/tiny/genome.fa \
   -S toy_species \
-  -r 1 \
   -k 5 \
   -k 6 \
   -m 3 \

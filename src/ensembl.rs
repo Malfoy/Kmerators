@@ -22,13 +22,17 @@ struct GeneRef {
 }
 
 pub fn current_release(species: &str) -> Result<String> {
-    let url = format!("{BASE_URL}/current_mysql");
+    let url = format!("{BASE_URL}/current/mysql/");
     let html = get_text(&url)?;
+    parse_current_release(&html, species)
+}
+
+fn parse_current_release(html: &str, species: &str) -> Result<String> {
     let prefix = format!("{species}_core_");
-    let link = extract_hrefs(&html)
+    let link = extract_hrefs(html)
         .into_iter()
         .find(|href| href.starts_with(&prefix))
-        .with_context(|| format!("species {species} not found in Ensembl current_mysql"))?;
+        .with_context(|| format!("species {species} not found in Ensembl current/mysql listing"))?;
     let parts = link.trim_end_matches('/').split('_').collect::<Vec<_>>();
     let release = parts
         .get(parts.len().saturating_sub(2))
@@ -383,4 +387,34 @@ fn extract_hrefs(html: &str) -> Vec<String> {
 #[allow(dead_code)]
 fn path_exists(path: &Path) -> bool {
     path.exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_species_release_from_current_mysql_listing() {
+        let html = r#"
+            <a href="homo_sapiens_core_116_38/">homo_sapiens_core_116_38/</a>
+            <a href="mus_musculus_core_116_39/">mus_musculus_core_116_39/</a>
+        "#;
+
+        assert_eq!(parse_current_release(html, "homo_sapiens").unwrap(), "116");
+        assert_eq!(parse_current_release(html, "mus_musculus").unwrap(), "116");
+    }
+
+    #[test]
+    fn rejects_species_missing_from_current_mysql_listing() {
+        let err = parse_current_release(
+            r#"<a href="homo_sapiens_core_116_38/">human</a>"#,
+            "toy_species",
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("species toy_species not found in Ensembl current/mysql listing")
+        );
+    }
 }

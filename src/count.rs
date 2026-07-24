@@ -41,6 +41,7 @@ pub struct CountIndex {
     partitions: Vec<Partition>,
     active_simd_partitions: Vec<bool>,
     query_count: usize,
+    counter_members: Vec<Vec<KmerId>>,
 }
 
 impl CountIndex {
@@ -60,24 +61,40 @@ impl CountIndex {
             partitions: (0..hash_table_count).map(|_| Partition::new()).collect(),
             active_simd_partitions: vec![false; hash_table_count],
             query_count: seeds.len(),
+            counter_members: Vec::new(),
         };
+        let mut counter_by_key = HashMap::<u64, KmerId>::new();
 
         for seed in seeds {
+            let key = match key_kind {
+                CountKey::Forward => seed.forward_key,
+                CountKey::Canonical => seed.canonical_key,
+            };
+            let counter_id = if let Some(&counter_id) = counter_by_key.get(&key) {
+                index.counter_members[counter_id].push(seed.id);
+                counter_id
+            } else {
+                let counter_id = index.counter_members.len();
+                counter_by_key.insert(key, counter_id);
+                index.counter_members.push(vec![seed.id]);
+                counter_id
+            };
+
             match key_kind {
                 CountKey::Forward => {
                     if let Some(minimizer) = scalar_minimizer(seed.seq, m) {
-                        index.insert(minimizer, seed.forward_key, seed.id);
+                        index.insert(minimizer, seed.forward_key, counter_id);
                     }
                     index.insert_simd_minimizers(seed.seq);
                 }
                 CountKey::Canonical => {
                     if let Some(minimizer) = scalar_minimizer(seed.seq, m) {
-                        index.insert(minimizer, seed.canonical_key, seed.id);
+                        index.insert(minimizer, seed.canonical_key, counter_id);
                     }
                     index.insert_simd_minimizers(seed.seq);
                     if let Some(rc) = kmer::revcomp(seed.seq) {
                         if let Some(minimizer) = scalar_minimizer(&rc, m) {
-                            index.insert(minimizer, seed.canonical_key, seed.id);
+                            index.insert(minimizer, seed.canonical_key, counter_id);
                         }
                         index.insert_simd_minimizers(&rc);
                     }
@@ -116,8 +133,19 @@ impl CountIndex {
         }
     }
 
-    pub fn query_count(&self) -> usize {
-        self.query_count
+    fn counter_count(&self) -> usize {
+        self.counter_members.len()
+    }
+
+    fn expand_counts(&self, compact: Vec<u32>) -> Vec<u32> {
+        debug_assert_eq!(compact.len(), self.counter_members.len());
+        let mut expanded = vec![0u32; self.query_count];
+        for (count, members) in compact.into_iter().zip(&self.counter_members) {
+            for &query_id in members {
+                expanded[query_id] = count;
+            }
+        }
+        expanded
     }
 
     pub fn is_empty(&self) -> bool {
@@ -138,7 +166,7 @@ pub fn count_path_many(
     let shapes = index_shapes(&indexes);
     let active = active_indexes(&indexes);
     if active.is_empty() {
-        return Ok(zero_counts(&shapes));
+        return Ok(expand_counts(&indexes, zero_counts(&shapes)));
     }
 
     let active = Arc::new(active);
@@ -175,7 +203,7 @@ pub fn count_path_many(
         add_counts(&mut total, local);
     }
 
-    Ok(total)
+    Ok(expand_counts(&indexes, total))
 }
 
 #[allow(dead_code)]
@@ -195,7 +223,7 @@ pub fn count_transcriptome_records_many(
     let shapes = index_shapes(&indexes);
     let active = active_indexes(&indexes);
     if active.is_empty() {
-        return zero_counts(&shapes);
+        return expand_counts(&indexes, zero_counts(&shapes));
     }
 
     let active = Arc::new(active);
@@ -222,11 +250,19 @@ pub fn count_transcriptome_records_many(
         let local = handle.join().expect("transcriptome worker panicked");
         add_counts(&mut total, local);
     }
-    total
+    expand_counts(&indexes, total)
 }
 
 fn index_shapes(indexes: &[Arc<CountIndex>]) -> Vec<usize> {
-    indexes.iter().map(|index| index.query_count()).collect()
+    indexes.iter().map(|index| index.counter_count()).collect()
+}
+
+fn expand_counts(indexes: &[Arc<CountIndex>], compact: Vec<Vec<u32>>) -> Vec<Vec<u32>> {
+    indexes
+        .iter()
+        .zip(compact)
+        .map(|(index, counts)| index.expand_counts(counts))
+        .collect()
 }
 
 fn active_indexes(indexes: &[Arc<CountIndex>]) -> Vec<(usize, Arc<CountIndex>)> {
@@ -444,5 +480,18 @@ mod tests {
         let actual = count_transcriptome_records_many(&records, vec![many_k3, many_k4], 2);
 
         assert_eq!(actual, vec![expected_k3, expected_k4]);
+    }
+
+    #[test]
+    fn duplicate_query_kmers_share_a_counter_and_expand_to_each_position() {
+        let records = vec![TranscriptRecord {
+            id: "TR1".to_string(),
+            seq: b"ACGACG".to_vec(),
+        }];
+        let seeds = vec![seed(0, b"ACG"), seed(1, b"ACG")];
+        let index = Arc::new(CountIndex::new(3, 2, 8, CountKey::Forward, &seeds));
+
+        assert_eq!(index.counter_count(), 1);
+        assert_eq!(count_transcriptome_records(&records, index, 2), vec![2, 2]);
     }
 }

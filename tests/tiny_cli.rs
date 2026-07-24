@@ -45,8 +45,6 @@ fn run_tiny_with_paths(
         .arg(genome)
         .arg("-S")
         .arg("toy_species")
-        .arg("-r")
-        .arg("1")
         .arg("-k")
         .arg("5")
         .arg("-m")
@@ -107,6 +105,14 @@ fn tiny_fasta_cli_defaults_to_no_kmer_file() {
 
     let report = read_text(out_dir.join("report.md"));
     assert!(report.contains("q1: q1 - kmers/contigs: 2/2 (fasta)"));
+    assert!(report.contains("**Release:** `local`"));
+    assert!(report.contains("## Parameters"));
+    assert!(report.contains("| k/minimizer | 5/3 |"));
+    assert!(report.contains("## Inputs"));
+    assert!(report.contains("| transcriptome |"));
+    assert!(report.contains("## Performance"));
+    #[cfg(target_os = "linux")]
+    assert!(report.contains("**Peak RSS:**"));
 }
 
 #[test]

@@ -4,8 +4,6 @@ use clap::Parser;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 #[derive(Parser, Debug)]
 #[command(
     name = "kmerators",
@@ -77,10 +75,6 @@ pub struct Cli {
     /// Worker thread count.
     #[arg(short = 't', long = "thread")]
     pub thread: Option<usize>,
-
-    /// Temporary directory.
-    #[arg(long = "tmpdir")]
-    pub tmpdir: Option<PathBuf>,
 
     /// Show more details.
     #[arg(short = 'D', long = "debug")]
@@ -162,7 +156,6 @@ pub struct Args {
     pub output: PathBuf,
     pub write_kmers: bool,
     pub thread: usize,
-    pub tmpdir: Option<PathBuf>,
     pub debug: bool,
     pub keep: bool,
     pub yes: bool,
@@ -247,7 +240,6 @@ impl Args {
             output,
             write_kmers,
             thread,
-            tmpdir: cli.tmpdir,
             debug: cli.debug,
             keep,
             yes,
@@ -336,18 +328,20 @@ fn selected_mode(cli: &Cli) -> Result<Mode> {
 }
 
 fn validate(args: &mut Args) -> Result<()> {
-    if args.release == "last"
-        && matches!(
-            args.mode,
-            Mode::Extract | Mode::Info | Mode::MakeDataset | Mode::UpdateDataset
-        )
-    {
-        args.release = crate::ensembl::current_release(&args.specie).with_context(|| {
-            format!(
-                "failed to resolve current Ensembl release for {}",
-                args.specie
-            )
-        })?;
+    if args.release == "last" {
+        let fully_local = args.mode == Mode::Extract
+            && args.fasta_file.is_some()
+            && args.transcriptome_fasta.is_some();
+        if fully_local {
+            args.release = "local".to_string();
+        } else if matches!(args.mode, Mode::Extract | Mode::Info | Mode::MakeDataset) {
+            args.release = crate::ensembl::current_release(&args.specie).with_context(|| {
+                format!(
+                    "failed to resolve current Ensembl release for {}",
+                    args.specie
+                )
+            })?;
+        }
     }
 
     match args.mode {
@@ -456,7 +450,6 @@ mod tests {
             output: None,
             write_kmers: false,
             thread: None,
-            tmpdir: None,
             debug: false,
             keep: false,
             yes: false,
@@ -487,7 +480,6 @@ mod tests {
         cli.transcriptome_fasta = Some(transcriptome.clone());
         cli.genome = Some(genome.clone());
         cli.specie = Some("toy_species".to_string());
-        cli.release = Some("1".to_string());
         cli.kmer_length = vec![5];
         cli.minimizer_length = Some(3);
         cli.hash_table_count = Some(64);
@@ -502,7 +494,7 @@ mod tests {
         assert_eq!(args.fasta_file, Some(query));
         assert_eq!(args.transcriptome_fasta, Some(transcriptome));
         assert_eq!(args.genome, Some(genome));
-        assert_eq!(args.release, "1");
+        assert_eq!(args.release, "local");
         assert_eq!(args.output, output);
         assert_eq!(args.kmer_specs.len(), 1);
         assert_eq!(args.kmer_specs[0].kmer_length, 5);

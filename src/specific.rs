@@ -1,4 +1,4 @@
-use crate::cli::{Args, KmerSpec, VERSION};
+use crate::cli::{Args, KmerSpec};
 use crate::count::{self, CountIndex, CountKey, QuerySeed};
 use crate::dataset::{self, Dataset, Gene, Transcriptome};
 use crate::fastx;
@@ -6,10 +6,11 @@ use crate::kmer::{self, KeyMode};
 use crate::output::{self, RunReport};
 use anyhow::{Context, Result, bail};
 use hashbrown::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ItemKind {
@@ -50,6 +51,7 @@ struct SpecificRun {
 
 pub fn extract_specific_kmers(args: &Args) -> Result<()> {
     let total_timer = PhaseTimer::start("Total extraction");
+    let mut phase_timings = Vec::new();
     if args.debug {
         let k_specs = args
             .kmer_specs
@@ -58,14 +60,8 @@ pub fn extract_specific_kmers(args: &Args) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ");
         eprintln!(
-            "k/m={}, hash_tables={}, threads={}, tmpdir={}",
-            k_specs,
-            args.hash_table_count,
-            args.thread,
-            args.tmpdir
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "<auto>".to_string())
+            "k/m={}, hash_tables={}, threads={}",
+            k_specs, args.hash_table_count, args.thread
         );
     }
 
@@ -74,12 +70,12 @@ pub fn extract_specific_kmers(args: &Args) -> Result<()> {
             "Load dataset {} / release {}",
             args.specie, args.release
         ));
-        let dataset = if let Some(path) = &args.transcriptome_fasta {
-            load_local_transcriptome_dataset(args, path)?
+        let dataset = if args.transcriptome_fasta.is_some() {
+            local_dataset(args)
         } else {
             dataset::load_dataset(args)?
         };
-        timer.finish();
+        phase_timings.push(timer.finish());
         dataset
     };
     let mut base_report = RunReport::default();
@@ -91,7 +87,7 @@ pub fn extract_specific_kmers(args: &Args) -> Result<()> {
         } else {
             load_fasta_items(args, &mut base_report)?
         };
-        timer.finish();
+        phase_timings.push(timer.finish());
         items
     };
     if items.is_empty() {
@@ -101,7 +97,7 @@ pub fn extract_specific_kmers(args: &Args) -> Result<()> {
     let mut runs = {
         let timer = PhaseTimer::start("Build query k-mer occurrences");
         let runs = prepare_specific_runs(args, &items, &base_report)?;
-        timer.finish();
+        phase_timings.push(timer.finish());
         runs
     };
     if runs.iter().all(|run| run.occurrences.is_empty()) {
@@ -123,17 +119,21 @@ pub fn extract_specific_kmers(args: &Args) -> Result<()> {
                 ))
             })
             .collect::<Vec<_>>();
-        timer.finish();
+        phase_timings.push(timer.finish());
         indexes
     };
     let tr_counts = {
         let timer = PhaseTimer::start("Count query k-mers in transcriptome");
-        let counts = count::count_transcriptome_records_many(
-            &dataset.transcriptome.records,
-            tr_indexes,
-            args.thread,
-        );
-        timer.finish();
+        let counts = if let Some(path) = &args.transcriptome_fasta {
+            count::count_path_many(path, tr_indexes, args.thread)?
+        } else {
+            count::count_transcriptome_records_many(
+                &dataset.transcriptome.records,
+                tr_indexes,
+                args.thread,
+            )
+        };
+        phase_timings.push(timer.finish());
         counts
     };
 
@@ -153,13 +153,13 @@ pub fn extract_specific_kmers(args: &Args) -> Result<()> {
                 ))
             })
             .collect::<Vec<_>>();
-        timer.finish();
+        phase_timings.push(timer.finish());
         indexes
     };
     let ge_counts = {
         let timer = PhaseTimer::start("Count query k-mers in genome");
         let counts = count::count_path_many(genome, ge_indexes, args.thread)?;
-        timer.finish();
+        phase_timings.push(timer.finish());
         counts
     };
 
@@ -171,7 +171,7 @@ pub fn extract_specific_kmers(args: &Args) -> Result<()> {
                 occ.genome_count = ge_counts[idx];
             }
         }
-        timer.finish();
+        phase_timings.push(timer.finish());
     }
 
     {
@@ -179,7 +179,7 @@ pub fn extract_specific_kmers(args: &Args) -> Result<()> {
         for run in &mut runs {
             annotate_isoform_counts(run.spec, &dataset, &items, &mut run.occurrences)?;
         }
-        timer.finish();
+        phase_timings.push(timer.finish());
     }
 
     {
@@ -190,27 +190,38 @@ pub fn extract_specific_kmers(args: &Args) -> Result<()> {
             let output_timer =
                 PhaseTimer::start(format!("Write output for k={}", run.spec.kmer_length));
             write_run_outputs(args, &items, run)?;
-            output_timer.finish();
+            phase_timings.push(output_timer.finish());
         }
-        timer.finish();
+        phase_timings.push(timer.finish());
     }
 
     let printed_report = {
         let timer = PhaseTimer::start("Write summary report");
+        let inputs = collect_input_metadata(args)?;
+        let total_elapsed = total_timer.elapsed();
+        for run in &runs {
+            let metadata = report_metadata(
+                args,
+                &inputs,
+                &phase_timings,
+                &[(run.spec.kmer_length, run.spec.minimizer_length)],
+                total_elapsed,
+            );
+            output::write_markdown_report(&run.output.join("report.md"), &metadata, &run.report)?;
+        }
         let printed_report = if runs.len() == 1 {
             runs[0].report.clone()
         } else {
             let report = summarize_runs(&runs);
-            output::write_markdown_report(
-                &args.output.join("report.md"),
-                &format!("kmerators v{VERSION}; k={}", format_k_list(&runs)),
-                &args.specie,
-                &args.release,
-                &report,
-            )?;
+            let specs = runs
+                .iter()
+                .map(|run| (run.spec.kmer_length, run.spec.minimizer_length))
+                .collect::<Vec<_>>();
+            let metadata = report_metadata(args, &inputs, &phase_timings, &specs, total_elapsed);
+            output::write_markdown_report(&args.output.join("report.md"), &metadata, &report)?;
             report
         };
-        timer.finish();
+        phase_timings.push(timer.finish());
         printed_report
     };
     output::print_report(&printed_report);
@@ -236,13 +247,18 @@ impl PhaseTimer {
         }
     }
 
-    fn finish(mut self) {
+    fn elapsed(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    fn finish(mut self) -> output::PhaseTiming {
         self.finished = true;
-        eprintln!(
-            "{} done in {}",
-            self.label,
-            format_duration(self.start.elapsed())
-        );
+        let elapsed = self.start.elapsed();
+        eprintln!("{} done in {}", self.label, format_duration(elapsed));
+        output::PhaseTiming {
+            label: self.label.clone(),
+            elapsed,
+        }
     }
 }
 
@@ -262,15 +278,91 @@ fn format_duration(duration: Duration) -> String {
     format!("{:.3}s", duration.as_secs_f64())
 }
 
-fn load_local_transcriptome_dataset(args: &Args, path: &std::path::Path) -> Result<Dataset> {
-    let records = fastx::read_records(path)?
-        .into_iter()
-        .map(|rec| dataset::TranscriptRecord {
-            id: fastx::first_token_without_version(&rec.header),
-            seq: rec.seq,
-        })
-        .collect::<Vec<_>>();
-    Ok(Dataset {
+fn collect_input_metadata(args: &Args) -> Result<Vec<output::InputMetadata>> {
+    let mut inputs = Vec::new();
+    if let Some(path) = &args.fasta_file {
+        inputs.push(input_metadata("query", path)?);
+    }
+    if let Some(path) = &args.transcriptome_fasta {
+        inputs.push(input_metadata("transcriptome", path)?);
+    } else {
+        inputs.push(input_metadata("dataset", &dataset::dataset_path(args)?)?);
+    }
+    if let Some(path) = &args.genome {
+        inputs.push(input_metadata("genome", path)?);
+    }
+    Ok(inputs)
+}
+
+fn input_metadata(role: &str, path: &std::path::Path) -> Result<output::InputMetadata> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let modified_unix_seconds = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_secs());
+    Ok(output::InputMetadata {
+        role: role.to_string(),
+        path: std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+        size_bytes: metadata.len(),
+        modified_unix_seconds,
+    })
+}
+
+fn report_metadata(
+    args: &Args,
+    inputs: &[output::InputMetadata],
+    phases: &[output::PhaseTiming],
+    kmer_specs: &[(usize, usize)],
+    total_elapsed: Duration,
+) -> output::ReportMetadata {
+    output::ReportMetadata {
+        command: actual_command(),
+        species: args.specie.clone(),
+        release: args.release.clone(),
+        kmer_specs: kmer_specs.to_vec(),
+        hash_table_count: args.hash_table_count,
+        max_on_transcriptome: args.max_on_transcriptome,
+        max_on_genome: args.max_on_genome,
+        threads: args.thread,
+        stringent: args.stringent,
+        write_kmers: args.write_kmers,
+        inputs: inputs.to_vec(),
+        phases: phases.to_vec(),
+        total_elapsed,
+        peak_rss_kib: peak_rss_kib(),
+    }
+}
+
+fn actual_command() -> String {
+    std::env::args_os()
+        .map(|arg| shell_quote(&arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &OsStr) -> String {
+    let value = value.to_string_lossy();
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/_-.=:".contains(&byte))
+    {
+        value.into_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn peak_rss_kib() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let value = status.lines().find(|line| line.starts_with("VmHWM:"))?;
+    value.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn local_dataset(args: &Args) -> Dataset {
+    Dataset {
         species: args.specie.clone(),
         release: args.release.clone(),
         assembly: "local".to_string(),
@@ -283,8 +375,8 @@ fn load_local_transcriptome_dataset(args: &Args, path: &std::path::Path) -> Resu
             aliases: std::collections::HashMap::new(),
             transcripts: std::collections::HashMap::new(),
         },
-        transcriptome: dataset::Transcriptome::new(records),
-    })
+        transcriptome: dataset::Transcriptome::new(Vec::new()),
+    }
 }
 
 fn prepare_specific_runs(
@@ -343,18 +435,6 @@ fn write_run_outputs(args: &Args, items: &[QueryItem], run: &mut SpecificRun) ->
         &mut run.report,
         &run.output,
         run.spec.kmer_length,
-    )?;
-    let command = if args.kmer_specs.len() == 1 {
-        format!("kmerators v{VERSION}")
-    } else {
-        format!("kmerators v{VERSION}; k={}", run.spec.kmer_length)
-    };
-    output::write_markdown_report(
-        &run.output.join("report.md"),
-        &command,
-        &args.specie,
-        &args.release,
-        &run.report,
     )
 }
 
@@ -372,13 +452,6 @@ fn summarize_runs(runs: &[SpecificRun]) -> RunReport {
 
 fn append_prefixed(dst: &mut Vec<String>, src: &[String], prefix: &str) {
     dst.extend(src.iter().map(|line| format!("{prefix}{line}")));
-}
-
-fn format_k_list(runs: &[SpecificRun]) -> String {
-    runs.iter()
-        .map(|run| run.spec.kmer_length.to_string())
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 pub fn show_info(args: &Args) -> Result<()> {
@@ -723,12 +796,7 @@ fn occurrence_seq<'a>(items: &'a [QueryItem], occ: &Occurrence, kmer_length: usi
     &items[occ.item_idx].seq[start..start + kmer_length]
 }
 
-fn contig_seq<'a>(
-    item: &'a QueryItem,
-    contig_start: usize,
-    last_pos: usize,
-    kmer_length: usize,
-) -> &'a [u8] {
+fn contig_seq(item: &QueryItem, contig_start: usize, last_pos: usize, kmer_length: usize) -> &[u8] {
     let start = contig_start - 1;
     let end = last_pos + kmer_length - 1;
     &item.seq[start..end]
@@ -1057,7 +1125,6 @@ mod tests {
             output: output.clone(),
             write_kmers: true,
             thread: 2,
-            tmpdir: None,
             debug: false,
             keep: false,
             yes: true,

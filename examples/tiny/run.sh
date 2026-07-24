@@ -13,7 +13,6 @@ cargo run --release --bin kmerators --manifest-path "${ROOT_DIR}/Cargo.toml" -- 
   --transcriptome-fasta "${SCRIPT_DIR}/transcriptome.fa" \
   -g "${SCRIPT_DIR}/genome.fa" \
   -S toy_species \
-  -r 1 \
   -k 5 \
   -m 3 \
   --hash-tables 64 \

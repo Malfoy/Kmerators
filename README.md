@@ -73,15 +73,14 @@ kmerators \
   --transcriptome-fasta transcriptome.fa.gz \
   -g genome.fa.gz \
   -S my_species \
-  -r 1 \
   -k 31 \
   -o output \
   -t 16 \
   -y
 ```
 
-The `-r 1` value keeps this local-file command offline. If `-r` is omitted, the
-default release is `last`, which asks Ensembl for the current release.
+When both `--fasta-file` and `--transcriptome-fasta` are supplied, the run is
+fully local and the reported release is `local`. No Ensembl lookup is made.
 
 FASTA/FASTQ inputs can be plain text or compressed as `.gz`, `.zst`, or `.xz`.
 
@@ -111,7 +110,6 @@ kmerators \
   --transcriptome-fasta transcriptome.fa.gz \
   -g genome.fa.gz \
   -S my_species \
-  -r 1 \
   -k 31 \
   -k 41 \
   -k 51 \
@@ -197,7 +195,6 @@ kmerators ... \
 - `--hash-tables`: minimizer-routed hash table count; default `1024`
 - `--write-kmers`: write retained k-mers to `kmers.fa`; disabled by default
 - `-t, --thread`: worker thread count; default is available CPU count
-- `--tmpdir`: temporary directory
 - `--keep`: keep intermediate files where applicable
 - `-D, --debug`: print extra run details
 
